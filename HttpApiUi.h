@@ -1,3 +1,7 @@
+#pragma once
+
+#include <ArduinoJson.h>
+
 // ====== UI API & SPA (single-file) ==========================================
 static const char UI_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang="cs"><head>

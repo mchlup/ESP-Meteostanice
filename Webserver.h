@@ -408,73 +408,93 @@ boot();
 
 // ---------- Helpers to send JSON ----------
 static void sendJSON(const String& s){ server.send(200, "application/json; charset=utf-8", s); }
-static void sendErr(int code, const String& msg){ server.send(code, "application/json; charset=utf-8", String("{\"error\":\"")+msg+"\"}"); }
+
+template <typename TJsonDocument>
+static void sendJSONDoc(const TJsonDocument& doc){
+  String payload;
+  payload.reserve(512);
+  serializeJson(doc, payload);
+  sendJSON(payload);
+}
+
+static void sendErr(int code, const String& msg){
+  StaticJsonDocument<128> doc;
+  doc["error"] = msg;
+
+  String payload;
+  serializeJson(doc, payload);
+  server.send(code, "application/json; charset=utf-8", payload);
+}
 
 // ---------- API: /api/status ---------------------------------------------------
 static void apiStatus(){
   // Modbus mirrors / live values
   auto H = [&](uint16_t r){ return mb.Hreg(r); };
-  uint32_t qnh = ((uint32_t)H(32)<<16) | H(33);
-  int32_t  alt_cm = (int32_t)(((uint32_t)H(34)<<16) | H(35));
-  char icao[5]; readICAOFromRegs(47,48,icao);
+  const uint32_t qnh = ((uint32_t)H(32) << 16) | H(33);
+  const int32_t alt_cm = (int32_t)(((uint32_t)H(34) << 16) | H(35));
+  char icao[5];
+  readICAOFromRegs(47, 48, icao);
 
-  // I2C poslední scan sloty (96..111)
-  String i2c="["; bool first=true;
-  for(uint8_t i=0;i<16;i++){ uint16_t a=H(96+i); if(a){ if(!first)i2c+=','; i2c+=String(a); first=false; } }
-  i2c+="]";
+  const bool wifiConnected = (WiFi.status() == WL_CONNECTED);
+  const IPAddress ip = WiFi.localIP();
 
-  String s="{";
-  s += "\"deviceName\":\""+String(CFG.deviceName)+"\"";
-  s += ",\"fw_major\":"+String(FW_MAJOR)+",\"fw_minor\":"+String(FW_MINOR);
-  s += ",\"wifi_ok\":" + String(WiFi.status()==WL_CONNECTED?"true":"false");
-  s += ",\"ip\":\""+ (WiFi.status()==WL_CONNECTED?WiFi.localIP().toString():"0.0.0.0") +"\"";
-  s += ",\"rssi\":"+String(WiFi.RSSI());
-  s += ",\"unitId\":"+String(CFG.unitId);
-  s += ",\"uptime_s\":"+String((millis()-bootMillis)/1000UL);
-  s += ",\"altMode\":"+String((unsigned)mb.Hreg(39));
+  StaticJsonDocument<768> doc;
+  doc["deviceName"] = CFG.deviceName;
+  doc["fw_major"] = FW_MAJOR;
+  doc["fw_minor"] = FW_MINOR;
+  doc["wifi_ok"] = wifiConnected;
+  doc["ip"] = wifiConnected ? ip.toString() : String("0.0.0.0");
+  doc["rssi"] = WiFi.RSSI();
+  doc["unitId"] = CFG.unitId;
+  doc["uptime_s"] = (millis() - bootMillis) / 1000UL;
+  doc["altMode"] = (unsigned)mb.Hreg(39);
 
   // sensors + derived
-  s += ",\"htu_ok\":"+String(htu_ok?"true":"false");
-  s += ",\"bh_ok\":"+String(bh_ok?"true":"false");
-  s += ",\"bmp_ok\":"+String(bmp_ok?"true":"false");
-  s += ",\"t_htu\":"+String((int32_t)mb.Hreg(10));
-  s += ",\"rh_htu\":"+String((uint32_t)mb.Hreg(11));
-  s += ",\"t_bmp\":"+String((int32_t)mb.Hreg(12));
-  s += ",\"p_bmp\":"+String(((uint32_t)H(13)<<16) | H(14));
-  s += ",\"lux\":"+String(((uint32_t)H(15)<<16) | H(16));
-  s += ",\"qnh\":"+String(qnh);
-  s += ",\"alt_cm\":"+String(alt_cm);
-  s += ",\"td\":"+String((int32_t)H(40));
-  s += ",\"ah\":"+String((uint32_t)H(41));
-  s += ",\"vpd\":"+String((uint32_t)H(42));
-  s += ",\"icao\":\""+String(icao)+"\"";
+  doc["htu_ok"] = htu_ok;
+  doc["bh_ok"] = bh_ok;
+  doc["bmp_ok"] = bmp_ok;
+  doc["t_htu"] = (int32_t)mb.Hreg(10);
+  doc["rh_htu"] = (uint32_t)mb.Hreg(11);
+  doc["t_bmp"] = (int32_t)mb.Hreg(12);
+  doc["p_bmp"] = ((uint32_t)H(13) << 16) | H(14);
+  doc["lux"] = ((uint32_t)H(15) << 16) | H(16);
+  doc["qnh"] = qnh;
+  doc["alt_cm"] = alt_cm;
+  doc["td"] = (int32_t)H(40);
+  doc["ah"] = (uint32_t)H(41);
+  doc["vpd"] = (uint32_t)H(42);
+  doc["icao"] = icao;
 
   // AutoQNH info
-  s += ",\"aq_last_result\":"+String((uint32_t)H(45));
-  s += ",\"aq_dist10\":"+String((uint32_t)H(46));
-  s += ",\"aq_last_up_s\":"+String((((uint32_t)H(49)<<16) | H(50)));
+  doc["aq_last_result"] = (uint32_t)H(45);
+  doc["aq_dist10"] = (uint32_t)H(46);
+  doc["aq_last_up_s"] = ((uint32_t)H(49) << 16) | H(50);
 
-  s += ",\"i2c\":"+i2c;
-  s += "}";
-  sendJSON(s);
+  // I2C poslední scan sloty (96..111)
+  JsonArray i2c = doc.createNestedArray("i2c");
+  for (uint8_t i = 0; i < 16; i++) {
+    uint16_t a = H(96 + i);
+    if (a) i2c.add(a);
+  }
+
+  sendJSONDoc(doc);
 }
 
 // ---------- API: /api/config (GET/POST) ---------------------------------------
 static void apiConfigGet(){
-  String s="{";
-  s += "\"deviceName\":\""+String(CFG.deviceName)+"\"";
-  s += ",\"unitId\":"+String(CFG.unitId);
-  s += ",\"pollMs\":"+String(CFG.pollMs);
-  s += ",\"autoTest\":"+String(CFG.autoTest);
-  s += ",\"cfgElevation_m\":"+String((int)CFG.cfgElevation_m);
-  s += ",\"cfgQNH_Pa\":"+String((unsigned long)CFG.cfgQNH_Pa);
-  s += ",\"altMode\":"+String((unsigned)CFG.altMode);
-  s += ",\"autoQNH_enable\":"+String((unsigned)CFG.autoQNH_enable);
-  s += ",\"autoQNH_period_h\":"+String((unsigned)CFG.autoQNH_period_h);
-  s += ",\"autoQNH_manual_en\":"+String((unsigned)CFG.autoQNH_manual_en);
-  s += ",\"autoQNH_manual_icao\":\""+String(CFG.autoQNH_manual_icao)+"\"";
-  s += "}";
-  sendJSON(s);
+  StaticJsonDocument<384> doc;
+  doc["deviceName"] = CFG.deviceName;
+  doc["unitId"] = CFG.unitId;
+  doc["pollMs"] = CFG.pollMs;
+  doc["autoTest"] = CFG.autoTest;
+  doc["cfgElevation_m"] = (int)CFG.cfgElevation_m;
+  doc["cfgQNH_Pa"] = (unsigned long)CFG.cfgQNH_Pa;
+  doc["altMode"] = (unsigned)CFG.altMode;
+  doc["autoQNH_enable"] = (unsigned)CFG.autoQNH_enable;
+  doc["autoQNH_period_h"] = (unsigned)CFG.autoQNH_period_h;
+  doc["autoQNH_manual_en"] = (unsigned)CFG.autoQNH_manual_en;
+  doc["autoQNH_manual_icao"] = CFG.autoQNH_manual_icao;
+  sendJSONDoc(doc);
 }
 
 static bool readJsonBody(StaticJsonDocument<768> &doc){
@@ -509,18 +529,37 @@ static void apiConfigPost(){
   applyCfgFromJSON(d);
   if (persist) saveConfigFS();
 
-  String s = String("{\"ok\":true,\"msg\":\"") + (persist?"Uloženo do FS.":"Aplikováno.") + "\"}";
-  sendJSON(s);
+  StaticJsonDocument<128> resp;
+  resp["ok"] = true;
+  resp["msg"] = persist ? F("Uloženo do FS.") : F("Aplikováno.");
+  sendJSONDoc(resp);
 }
 
 // ---------- API: /api/action (POST) -------------------------------------------
 static void apiActionPost(){
   StaticJsonDocument<192> d; if(!readJsonBody(d)) return sendErr(400,"bad json");
   const char* cmd = d["cmd"] | "";
-  if (!strcmp(cmd,"scan")) { i2cScan(); return sendJSON("{\"ok\":true}"); }
-  if (!strcmp(cmd,"selftest")) { sensorSelfTest(); return sendJSON("{\"ok\":true}"); }
-  if (!strcmp(cmd,"aq_run")) { autoQNH_RunOnce(); return sendJSON("{\"ok\":true}"); }
-  if (!strcmp(cmd,"reboot")) { sendJSON("{\"ok\":true,\"reboot\":true}"); delay(200); ESP.restart(); return; }
+  if (!strcmp(cmd,"scan")) {
+    i2cScan();
+    StaticJsonDocument<64> resp; resp["ok"] = true; sendJSONDoc(resp); return;
+  }
+  if (!strcmp(cmd,"selftest")) {
+    sensorSelfTest();
+    StaticJsonDocument<64> resp; resp["ok"] = true; sendJSONDoc(resp); return;
+  }
+  if (!strcmp(cmd,"aq_run")) {
+    autoQNH_RunOnce();
+    StaticJsonDocument<64> resp; resp["ok"] = true; sendJSONDoc(resp); return;
+  }
+  if (!strcmp(cmd,"reboot")) {
+    StaticJsonDocument<64> resp;
+    resp["ok"] = true;
+    resp["reboot"] = true;
+    sendJSONDoc(resp);
+    delay(200);
+    ESP.restart();
+    return;
+  }
   sendErr(400,"unknown cmd");
 }
 
@@ -529,15 +568,17 @@ static void apiMBGet(){
   int addr = server.hasArg("addr") ? server.arg("addr").toInt() : 0;
   int n    = server.hasArg("n") ? server.arg("n").toInt() : 1; if(n<1) n=1; if(n>32) n=32;
   if (addr<0 || addr>199) return sendErr(400,"addr range");
-  String s="["; for(int i=0;i<n;i++){ if(i) s+=','; s+=String((unsigned)mb.Hreg(addr+i)); } s+="]";
-  sendJSON(s);
+  StaticJsonDocument<256> doc;
+  JsonArray arr = doc.to<JsonArray>();
+  for (int i = 0; i < n; i++) { arr.add((unsigned)mb.Hreg(addr + i)); }
+  sendJSONDoc(doc);
 }
 static void apiMBPost(){
   StaticJsonDocument<160> d; if(!readJsonBody(d)) return sendErr(400,"bad json");
   int addr = d["addr"] | -1; uint16_t val = (uint16_t)(unsigned)d["val"];
   if (addr<0 || addr>199) return sendErr(400,"addr range");
   mb.Hreg(addr,val);
-  sendJSON("{\"ok\":true}");
+  StaticJsonDocument<64> resp; resp["ok"] = true; sendJSONDoc(resp);
 }
 
 // ---------- Mount routes + SPA ------------------------------------------------

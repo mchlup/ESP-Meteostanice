@@ -14,7 +14,7 @@ Projekt obsahuje firmware pro meteostanici postavenou na ESP8266 nebo ESP32-C3. 
 ```
 .
 ├── README.md        – Tento dokument
-├── Webserver.h      – HTML/JS UI a REST API obslužný kód
+├── HttpApiUi.h      – HTML/JS UI a REST API obslužný kód
 └── main.ino         – Hlavní firmware, senzory, Modbus a logika AutoQNH
 ```
 

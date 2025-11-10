@@ -501,7 +501,8 @@ static void apiConfigGet(){
   sendJSONDoc(doc);
 }
 
-static bool readJsonBody(StaticJsonDocument<768> &doc){
+template <size_t Capacity>
+static bool readJsonBody(StaticJsonDocument<Capacity> &doc){
   if(!server.hasArg("plain")) return false;
   DeserializationError err = deserializeJson(doc, server.arg("plain"));
   return !err;

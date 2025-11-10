@@ -66,7 +66,6 @@
 #include <SparkFunHTU21D.h>
 #include <ModbusIP_ESP8266.h>
 #include <math.h>
-#include "HttpApiUi.h"
 
 // ----------------------------- DEBUG ------------------------------------------
 #define DEBUG 1
@@ -932,6 +931,8 @@ static void applyConfigToModbusMirror(){
   if (strlen(CFG.autoQNH_manual_icao)==4) writeICAOToRegs(52,53,CFG.autoQNH_manual_icao);
   WiFi.hostname(CFG.deviceName); // uplatni se po reconnectu
 }
+
+#include "HttpApiUi.h"
 
 // jednoduchy tokenizator s uvozovkami
 static int tokenize(const String& line, String* args, int maxArgs){

@@ -65,6 +65,7 @@
 #include <Adafruit_BMP085.h>
 #include <SparkFunHTU21D.h>
 #include <ModbusIP_ESP8266.h>
+#include <PubSubClient.h>
 #include <math.h>
 #include <time.h>
 #include <stdlib.h>
@@ -169,11 +170,141 @@ struct AppConfig {
   uint8_t  autoQNH_period_h = 8;   // výchozí 3× denně
   uint8_t  autoQNH_manual_en = 0;  // manuální ICAO override
   char     autoQNH_manual_icao[5] = ""; // 4 znaky + '\0'
+  uint8_t  mqtt_enable = 0;
+  String   mqtt_host = "";
+  uint16_t mqtt_port = 1883;
+  String   mqtt_clientId = "";
+  String   mqtt_username = "";
+  String   mqtt_password = "";
+  String   mqtt_baseTopic = "";
+  uint8_t  mqtt_ha_discovery = 1;
+  uint8_t  mqtt_loxone_discovery = 1;
 };
 AppConfig CFG;
 
 bool shouldSaveConfig = false;
 const char* CONFIG_PATH = "/config.json";
+
+static String chipIdHex(){
+#if defined(ARDUINO_ARCH_ESP32)
+  uint64_t mac = ESP.getEfuseMac();
+  char buf[17];
+  snprintf(buf, sizeof(buf), "%012llX", (unsigned long long)mac);
+  return String(buf);
+#else
+  uint32_t id = ESP.getChipId();
+  char buf[11];
+  snprintf(buf, sizeof(buf), "%06X", id & 0xFFFFFF);
+  return String(buf);
+#endif
+}
+
+static String sanitizeIdentifier(const String& in){
+  String out;
+  out.reserve(in.length());
+  for (size_t i = 0; i < in.length(); ++i) {
+    char c = in[i];
+    if (isalnum((unsigned char)c)) {
+      out += (char)tolower((unsigned char)c);
+    } else if (c == '-' || c == '_' ) {
+      out += c;
+    }
+  }
+  if (!out.length()) out = F("esp_meteostanice");
+  return out;
+}
+
+static String sanitizeClientId(const String& raw){
+  String out;
+  out.reserve(raw.length());
+  for (size_t i = 0; i < raw.length(); ++i) {
+    char c = raw[i];
+    if (isalnum((unsigned char)c) || c == '-' || c == '_' ) {
+      out += c;
+    }
+  }
+  if (!out.length()) out = String(F("ESP-Meteo-")) + chipIdHex();
+  const size_t MAX_LEN = 32;
+  if (out.length() > MAX_LEN) out.remove(MAX_LEN);
+  return out;
+}
+
+static String sanitizeTopicBase(const String& raw){
+  String out;
+  out.reserve(raw.length());
+  bool prevSlash = true;
+  for (size_t i = 0; i < raw.length(); ++i) {
+    char c = raw[i];
+    if (isalnum((unsigned char)c)) {
+      out += (char)tolower((unsigned char)c);
+      prevSlash = false;
+    } else if (c == '-' || c == '_') {
+      out += c;
+      prevSlash = false;
+    } else if (c == '/') {
+      if (prevSlash) continue;
+      out += '/';
+      prevSlash = true;
+    }
+  }
+  while (out.startsWith("/")) out.remove(0, 1);
+  while (out.endsWith("/")) out.remove(out.length() - 1);
+  if (!out.length()) out = F("meteostanice");
+  return out;
+}
+
+static String defaultMqttClientId(){
+  String id = sanitizeClientId(CFG.deviceName.length() ? (CFG.deviceName + String('-') + chipIdHex()) : String());
+  return id;
+}
+
+static String defaultMqttBaseTopic(){
+  String base = String(F("meteostanice/")) + sanitizeIdentifier(CFG.deviceName.length() ? CFG.deviceName : String(F("esp")));
+  base += '/';
+  base += chipIdHex();
+  return sanitizeTopicBase(base);
+}
+
+static void ensureMqttDefaults(){
+  CFG.mqtt_clientId = sanitizeClientId(CFG.mqtt_clientId.length() ? CFG.mqtt_clientId : defaultMqttClientId());
+  CFG.mqtt_baseTopic = sanitizeTopicBase(CFG.mqtt_baseTopic.length() ? CFG.mqtt_baseTopic : defaultMqttBaseTopic());
+  if (CFG.mqtt_port == 0 || CFG.mqtt_port > 65535) CFG.mqtt_port = 1883;
+}
+
+WiFiClient g_mqttNetClient;
+PubSubClient g_mqttClient(g_mqttNetClient);
+
+struct {
+  bool configDirty = true;
+  bool discoverySent = false;
+  bool needHaClear = false;
+  bool needLoxClear = false;
+  bool availabilityOnline = false;
+  uint32_t lastConnectAttempt = 0;
+  uint32_t lastStatePublish = 0;
+  String status = F("MQTT neaktivní");
+  int lastClientState = 0;
+} g_mqttState;
+
+static uint8_t g_mqttPrevEnable = 0;
+static uint8_t g_mqttPrevHaDiscovery = 1;
+static uint8_t g_mqttPrevLoxDiscovery = 1;
+
+static String mqttGetBaseTopic(){ return CFG.mqtt_baseTopic; }
+static String mqttAvailabilityTopic(){ return mqttGetBaseTopic() + F("/status"); }
+static String mqttDeviceId(){ return sanitizeIdentifier(CFG.deviceName.length() ? CFG.deviceName : String(F("esp_meteo"))) + String('_') + chipIdHex(); }
+static String mqttStateTopic(const char* key){ String base = mqttGetBaseTopic(); if (!base.length()) return String(); String topic = base; topic += '/'; topic += key; return topic; }
+static String mqttGetClientId(){ return CFG.mqtt_clientId; }
+
+static void mqttOnConfigChanged();
+static void mqttPublishAvailability(bool online);
+static void mqttPublishState(bool force);
+static void mqttLoop();
+static void mqttPublishDiscovery();
+static void mqttPublishHaDiscovery();
+static void mqttPublishLoxoneDiscovery();
+static void mqttPublishHaClear();
+static void mqttPublishLoxoneClear();
 
 // ----------------------------- WiFiManager params -----------------------------
 WiFiManager wm;
@@ -301,17 +432,26 @@ static inline void writeICAOToRegs(uint16_t rA, uint16_t rB, const char* icao){
 
 // ---- FS config I/O ----
 bool saveConfigFS(){
-  StaticJsonDocument<640> doc;
+  StaticJsonDocument<896> doc;
   doc["deviceName"]=CFG.deviceName; doc["unitId"]=CFG.unitId; doc["pollMs"]=CFG.pollMs; doc["autoTest"]=CFG.autoTest;
   doc["cfgElevation_m"]=CFG.cfgElevation_m; doc["cfgQNH_Pa"]=CFG.cfgQNH_Pa; doc["altMode"]=CFG.altMode;
   doc["autoQNH_enable"]=CFG.autoQNH_enable; doc["autoQNH_period_h"]=CFG.autoQNH_period_h;
   doc["autoQNH_manual_en"]=CFG.autoQNH_manual_en; doc["autoQNH_manual_icao"]=CFG.autoQNH_manual_icao;
+  doc["mqtt_enable"] = CFG.mqtt_enable;
+  doc["mqtt_host"] = CFG.mqtt_host;
+  doc["mqtt_port"] = CFG.mqtt_port;
+  doc["mqtt_clientId"] = CFG.mqtt_clientId;
+  doc["mqtt_username"] = CFG.mqtt_username;
+  doc["mqtt_password"] = CFG.mqtt_password;
+  doc["mqtt_baseTopic"] = CFG.mqtt_baseTopic;
+  doc["mqtt_ha_discovery"] = CFG.mqtt_ha_discovery;
+  doc["mqtt_loxone_discovery"] = CFG.mqtt_loxone_discovery;
   File f=LittleFS.open(CONFIG_PATH,"w"); if(!f) return false; if(serializeJson(doc,f)==0){ f.close(); return false; } f.close(); return true;
 }
 bool loadConfigFS(){
   if(!LittleFS.exists(CONFIG_PATH)) return false;
   File f=LittleFS.open(CONFIG_PATH,"r"); if(!f) return false;
-  StaticJsonDocument<640> doc; DeserializationError err=deserializeJson(doc,f); f.close(); if(err) return false;
+  StaticJsonDocument<896> doc; DeserializationError err=deserializeJson(doc,f); f.close(); if(err) return false;
   CFG.deviceName=doc["deviceName"].as<String>(); CFG.unitId=doc["unitId"]|1; CFG.pollMs=doc["pollMs"]|10000; CFG.autoTest=doc["autoTest"]|0;
   CFG.cfgElevation_m = (int16_t)(int)(doc["cfgElevation_m"] | 0);
   CFG.cfgQNH_Pa      = (uint32_t)(unsigned long)(doc["cfgQNH_Pa"] | 0);
@@ -321,8 +461,19 @@ bool loadConfigFS(){
   CFG.autoQNH_manual_en = (uint8_t)(unsigned int)(doc["autoQNH_manual_en"] | 0);
   const char* man = doc["autoQNH_manual_icao"] | "";
   strlcpy(CFG.autoQNH_manual_icao, man, sizeof(CFG.autoQNH_manual_icao));
+  CFG.mqtt_enable = (uint8_t)(unsigned int)(doc["mqtt_enable"] | CFG.mqtt_enable);
+  CFG.mqtt_host = doc["mqtt_host"] | CFG.mqtt_host;
+  CFG.mqtt_port = (uint16_t)(unsigned int)(doc["mqtt_port"] | CFG.mqtt_port);
+  CFG.mqtt_clientId = doc["mqtt_clientId"] | CFG.mqtt_clientId;
+  CFG.mqtt_username = doc["mqtt_username"] | CFG.mqtt_username;
+  CFG.mqtt_password = doc["mqtt_password"] | CFG.mqtt_password;
+  CFG.mqtt_baseTopic = doc["mqtt_baseTopic"] | CFG.mqtt_baseTopic;
+  CFG.mqtt_ha_discovery = (uint8_t)(unsigned int)(doc["mqtt_ha_discovery"] | CFG.mqtt_ha_discovery);
+  CFG.mqtt_loxone_discovery = (uint8_t)(unsigned int)(doc["mqtt_loxone_discovery"] | CFG.mqtt_loxone_discovery);
   if (CFG.altMode>3) CFG.altMode=0;
   if (CFG.autoQNH_period_h==0) CFG.autoQNH_period_h=8;
+
+  ensureMqttDefaults();
 
   // mirroring do WiFiManager bufferů
   strlcpy(deviceNameBuf, CFG.deviceName.c_str(), sizeof(deviceNameBuf));
@@ -339,6 +490,242 @@ bool loadConfigFS(){
   return true;
 }
 
+// ----------------------------- MQTT -------------------------------------------
+static bool mqttPublishNumber(const String& topic, float value, uint8_t decimals, bool retain = true){
+  if (!topic.length() || !isfinite(value)) return false;
+  String payload = String(value, static_cast<unsigned int>(decimals));
+  payload.replace(',', '.');
+  return g_mqttClient.publish(topic.c_str(), payload.c_str(), retain);
+}
+
+static void mqttPublishAvailability(bool online){
+  if (!g_mqttClient.connected()) return;
+  String topic = mqttAvailabilityTopic();
+  if (!topic.length()) return;
+  const char* payload = online ? "online" : "offline";
+  if (g_mqttClient.publish(topic.c_str(), payload, true)){
+    g_mqttState.availabilityOnline = online;
+  }
+}
+
+static void mqttPublishHaClear(){
+  if (!g_mqttClient.connected()) return;
+  static const char* KEYS[] = {"temperature","humidity","pressure","lux","dew_point","abs_humidity","vpd","qnh","altitude","bmp_temperature"};
+  const String deviceId = mqttDeviceId();
+  for (const char* key : KEYS){
+    String topic = String(F("homeassistant/sensor/")) + deviceId + '/' + key + F("/config");
+    g_mqttClient.publish(topic.c_str(), "", true);
+  }
+}
+
+static void mqttPublishLoxoneClear(){
+  if (!g_mqttClient.connected()) return;
+  String topic = String(F("loxone/")) + mqttDeviceId() + F("/config");
+  g_mqttClient.publish(topic.c_str(), "", true);
+}
+
+static void mqttPublishHaDiscovery(){
+  if (!g_mqttClient.connected() || !CFG.mqtt_ha_discovery) return;
+  struct SensorDesc { const char* key; const char* label; const char* unit; const char* deviceClass; const char* stateClass; uint8_t decimals; };
+  static const SensorDesc SENSORS[] = {
+    {"temperature",      "Teplota",          "°C",  "temperature", "measurement", 2},
+    {"humidity",         "Relativní vlhkost","%",   "humidity",    "measurement", 2},
+    {"pressure",         "Tlak",             "hPa", "pressure",    "measurement", 1},
+    {"lux",              "Osvit",            "lx",  "illuminance", "measurement", 0},
+    {"dew_point",        "Rosný bod",        "°C",  "temperature", "measurement", 2},
+    {"abs_humidity",     "Abs. vlhkost",     "g/m³",nullptr,        "measurement", 2},
+    {"vpd",              "VPD",              "Pa",  nullptr,        "measurement", 0},
+    {"qnh",              "QNH",              "hPa", "pressure",    "measurement", 1},
+    {"altitude",         "Nadmořská výška",  "m",   "distance",    "measurement", 2},
+    {"bmp_temperature",  "Teplota BMP",      "°C",  "temperature", "measurement", 2},
+  };
+  const String deviceId = mqttDeviceId();
+  String availability = mqttAvailabilityTopic();
+  String deviceName = CFG.deviceName.length() ? CFG.deviceName : String(F("ESP Meteostanice"));
+  char fwBuf[16]; snprintf(fwBuf, sizeof(fwBuf), "%u.%u", FW_MAJOR, FW_MINOR);
+
+  for (const SensorDesc& s : SENSORS){
+    String topic = String(F("homeassistant/sensor/")) + deviceId + '/' + s.key + F("/config");
+    StaticJsonDocument<512> doc;
+    String name = deviceName + String(F(" ")) + String(s.label);
+    doc["name"] = name;
+    doc["uniq_id"] = deviceId + '_' + s.key;
+    doc["stat_t"] = mqttStateTopic(s.key);
+    if (s.unit) doc["unit_of_meas"] = s.unit;
+    if (s.deviceClass) doc["dev_cla"] = s.deviceClass;
+    if (s.stateClass) doc["stat_cla"] = s.stateClass;
+    doc["avty_t"] = availability;
+    doc["pl_avail"] = "online";
+    doc["pl_not_avail"] = "offline";
+    doc["suggested_display_precision"] = s.decimals;
+    JsonObject device = doc.createNestedObject("device");
+    JsonArray ids = device.createNestedArray("identifiers");
+    ids.add(deviceId);
+    device["name"] = deviceName;
+    device["manufacturer"] = "ESP Meteostanice";
+    device["model"] = "ESP Meteostanice";
+    device["sw_version"] = fwBuf;
+
+    String payload;
+    serializeJson(doc, payload);
+    g_mqttClient.publish(topic.c_str(), payload.c_str(), true);
+  }
+}
+
+static void mqttPublishLoxoneDiscovery(){
+  if (!g_mqttClient.connected() || !CFG.mqtt_loxone_discovery) return;
+  StaticJsonDocument<512> doc;
+  doc["device"] = CFG.deviceName.length() ? CFG.deviceName : String(F("ESP Meteostanice"));
+  doc["base_topic"] = mqttGetBaseTopic();
+  JsonObject topics = doc.createNestedObject("topics");
+  topics["temperature"] = mqttStateTopic("temperature");
+  topics["humidity"] = mqttStateTopic("humidity");
+  topics["pressure_hpa"] = mqttStateTopic("pressure");
+  topics["lux"] = mqttStateTopic("lux");
+  topics["dew_point"] = mqttStateTopic("dew_point");
+  topics["abs_humidity"] = mqttStateTopic("abs_humidity");
+  topics["vpd_pa"] = mqttStateTopic("vpd");
+  topics["qnh_hpa"] = mqttStateTopic("qnh");
+  topics["altitude_m"] = mqttStateTopic("altitude");
+  topics["bmp_temperature"] = mqttStateTopic("bmp_temperature");
+
+  String payload;
+  serializeJson(doc, payload);
+  String topic = String(F("loxone/")) + mqttDeviceId() + F("/config");
+  g_mqttClient.publish(topic.c_str(), payload.c_str(), true);
+}
+
+static void mqttPublishDiscovery(){
+  if (!g_mqttClient.connected()) return;
+  if (!CFG.mqtt_ha_discovery && !CFG.mqtt_loxone_discovery){
+    g_mqttState.discoverySent = true;
+    return;
+  }
+  if (CFG.mqtt_ha_discovery) mqttPublishHaDiscovery();
+  else if (g_mqttState.needHaClear) { mqttPublishHaClear(); g_mqttState.needHaClear = false; }
+  if (CFG.mqtt_loxone_discovery) mqttPublishLoxoneDiscovery();
+  else if (g_mqttState.needLoxClear) { mqttPublishLoxoneClear(); g_mqttState.needLoxClear = false; }
+  g_mqttState.discoverySent = true;
+}
+
+static void mqttPublishState(bool force){
+  if (!CFG.mqtt_enable || !g_mqttClient.connected()) return;
+  uint32_t now = millis();
+  if (!force && (now - g_mqttState.lastStatePublish) < 200) return;
+  g_mqttState.lastStatePublish = now;
+
+  if (isfinite(g_htu_t)) mqttPublishNumber(mqttStateTopic("temperature"), g_htu_t, 2);
+  if (isfinite(g_htu_h)) mqttPublishNumber(mqttStateTopic("humidity"), g_htu_h, 2);
+  if (g_bmp_p > 0) mqttPublishNumber(mqttStateTopic("pressure"), g_bmp_p / 100.0f, 1);
+  if (isfinite(g_bh_lux)) mqttPublishNumber(mqttStateTopic("lux"), g_bh_lux, 1);
+  if (!isnan(g_bmp_t)) mqttPublishNumber(mqttStateTopic("bmp_temperature"), g_bmp_t, 2);
+
+  float Td = NAN;
+  float AH = NAN;
+  float VPD = NAN;
+  if (!isnan(g_htu_t) && !isnan(g_htu_h)){
+    Td = dewPointC(g_htu_t, g_htu_h);
+    AH = absHumidity_gm3(g_htu_t, g_htu_h);
+    VPD = es_Pa(g_htu_t) * (1.0f - clampf(g_htu_h,0,100)/100.0f);
+  }
+  if (isfinite(Td)) mqttPublishNumber(mqttStateTopic("dew_point"), Td, 2);
+  if (isfinite(AH)) mqttPublishNumber(mqttStateTopic("abs_humidity"), AH, 2);
+  if (isfinite(VPD)) mqttPublishNumber(mqttStateTopic("vpd"), VPD, 0);
+
+  uint32_t qnh = ((uint32_t)mb.Hreg(32) << 16) | (uint32_t)mb.Hreg(33);
+  if (qnh > 0) mqttPublishNumber(mqttStateTopic("qnh"), qnh / 100.0f, 1);
+
+  int32_t alt_cm = (int32_t)(((uint32_t)mb.Hreg(34) << 16) | (uint32_t)mb.Hreg(35));
+  mqttPublishNumber(mqttStateTopic("altitude"), alt_cm / 100.0f, 2);
+}
+
+static void mqttOnConfigChanged(){
+  ensureMqttDefaults();
+  CFG.mqtt_host.trim();
+  CFG.mqtt_username.trim();
+  CFG.mqtt_baseTopic = sanitizeTopicBase(CFG.mqtt_baseTopic);
+  CFG.mqtt_clientId = sanitizeClientId(CFG.mqtt_clientId);
+  bool enabled = CFG.mqtt_enable != 0;
+
+  if (!enabled){
+    if (g_mqttClient.connected()){
+      mqttPublishHaClear();
+      mqttPublishLoxoneClear();
+      mqttPublishAvailability(false);
+      g_mqttClient.disconnect();
+    }
+    g_mqttState.status = F("MQTT vypnuto");
+    g_mqttState.availabilityOnline = false;
+  }
+  else {
+    g_mqttState.status = CFG.mqtt_host.length() ? String(F("MQTT připraveno")) : String(F("MQTT: chybí host"));
+  }
+
+  if (g_mqttPrevHaDiscovery && !CFG.mqtt_ha_discovery) g_mqttState.needHaClear = true;
+  if (g_mqttPrevLoxDiscovery && !CFG.mqtt_loxone_discovery) g_mqttState.needLoxClear = true;
+
+  g_mqttState.configDirty = true;
+  g_mqttState.discoverySent = false;
+
+  g_mqttPrevEnable = enabled ? 1 : 0;
+  g_mqttPrevHaDiscovery = CFG.mqtt_ha_discovery ? 1 : 0;
+  g_mqttPrevLoxDiscovery = CFG.mqtt_loxone_discovery ? 1 : 0;
+}
+
+static void mqttLoop(){
+  if (!CFG.mqtt_enable){
+    return;
+  }
+
+  if (!CFG.mqtt_host.length()){
+    g_mqttState.status = F("MQTT: chybí host");
+    return;
+  }
+
+  if (WiFi.status() != WL_CONNECTED){
+    if (g_mqttClient.connected()){
+      mqttPublishAvailability(false);
+      g_mqttClient.disconnect();
+      g_mqttState.availabilityOnline = false;
+    }
+    g_mqttState.status = F("MQTT: čekám na Wi-Fi");
+    return;
+  }
+
+  if (g_mqttState.configDirty){
+    g_mqttClient.setServer(CFG.mqtt_host.c_str(), CFG.mqtt_port ? CFG.mqtt_port : 1883);
+    g_mqttState.configDirty = false;
+  }
+
+  if (!g_mqttClient.connected()){
+    g_mqttState.availabilityOnline = false;
+    if (millis() - g_mqttState.lastConnectAttempt < 5000) return;
+    g_mqttState.lastConnectAttempt = millis();
+    String clientId = mqttGetClientId();
+    const char* user = CFG.mqtt_username.length() ? CFG.mqtt_username.c_str() : nullptr;
+    const char* pass = CFG.mqtt_password.length() ? CFG.mqtt_password.c_str() : nullptr;
+    bool ok;
+    if (user){
+      ok = g_mqttClient.connect(clientId.c_str(), user, pass ? pass : "");
+    } else {
+      ok = g_mqttClient.connect(clientId.c_str());
+    }
+    if (ok){
+      g_mqttState.status = String(F("MQTT připojeno k ")) + CFG.mqtt_host + ':' + String(CFG.mqtt_port);
+      mqttPublishAvailability(true);
+      if (g_mqttState.needHaClear){ mqttPublishHaClear(); g_mqttState.needHaClear = false; }
+      if (g_mqttState.needLoxClear){ mqttPublishLoxoneClear(); g_mqttState.needLoxClear = false; }
+      mqttPublishDiscovery();
+      mqttPublishState(true);
+    } else {
+      g_mqttState.lastClientState = g_mqttClient.state();
+      g_mqttState.status = String(F("MQTT chyba (state=")) + String(g_mqttState.lastClientState) + ')';
+    }
+    return;
+  }
+
+  g_mqttClient.loop();
+}
 static bool icaoEquals(const char* a, const char* b){
   if (!a || !b) return false;
   for (uint8_t i=0;i<4;i++){
@@ -536,6 +923,8 @@ void applyParamsFromWM(){
   if (icao.length()==4){ strlcpy(CFG.autoQNH_manual_icao, icao.c_str(), sizeof(CFG.autoQNH_manual_icao)); }
   else { CFG.autoQNH_manual_icao[0]='\0'; if (CFG.autoQNH_manual_en) CFG.autoQNH_manual_en=0; }
   updateLocationFromConfig();
+  ensureMqttDefaults();
+  mqttOnConfigChanged();
 }
 
 // ----------------------------- Derived calc (Td, AH, VPD, Tv) ----------------
@@ -888,6 +1277,7 @@ void pollAndPublishSensors(){
   writeU32ToRegs(34, (uint32_t)alt_cm);
 
   // Status + uptime
+  mqttPublishState(false);
   mb.Hreg(0,computeStatus());
   writeU32ToRegs(20,(millis()-bootMillis)/1000u);
 }
@@ -1198,6 +1588,13 @@ static void printConfig(){
   Serial.printf("UnitID: %u, PollMs: %lu, AutoTest: %u\r\n", CFG.unitId, (unsigned long)CFG.pollMs, CFG.autoTest);
   Serial.printf("Elev: %d m, QNH_cfg: %lu Pa, AltMode: %u\r\n", (int)CFG.cfgElevation_m, (unsigned long)CFG.cfgQNH_Pa, (unsigned)CFG.altMode);
   Serial.printf("AutoQNH: %u / %uh, Manual: %u, ICAO: '%s'\r\n", (unsigned)CFG.autoQNH_enable, (unsigned)CFG.autoQNH_period_h, (unsigned)CFG.autoQNH_manual_en, CFG.autoQNH_manual_icao);
+  Serial.printf("MQTT: %s host=%s:%u base='%s' clientId='%s' user='%s' HA=%u Lox=%u\r\n",
+                CFG.mqtt_enable?"EN":"DIS",
+                CFG.mqtt_host.c_str(), (unsigned)CFG.mqtt_port,
+                CFG.mqtt_baseTopic.c_str(), CFG.mqtt_clientId.c_str(),
+                CFG.mqtt_username.c_str(),
+                (unsigned)CFG.mqtt_ha_discovery, (unsigned)CFG.mqtt_loxone_discovery);
+  Serial.printf("MQTT status: %s\r\n", g_mqttState.status.c_str());
   Serial.printf("Runtime: QNH=%lu Pa, ALT=%ld cm, AQres=%u, UsedICAO='%s', Dist10=%u\r\n",
                 (unsigned long)qnh, (long)alt_cm, (unsigned)mb.Hreg(45), icao, (unsigned)mb.Hreg(46));
   Serial.printf("WiFi: %s  IP: %s  RSSI:%d  Portal:%u\r\n",
@@ -1223,6 +1620,15 @@ static void printHelp(){
     "set aq_per <h>             - AutoQNH perioda (h)\r\n"
     "set aq_man 0|1             - manual ICAO enable\r\n"
     "set aq_icao XXXX           - manual ICAO (4 znaky)\r\n"
+    "set mqtt_en 0|1            - MQTT povolit / zakázat\r\n"
+    "set mqtt_host host         - MQTT broker\r\n"
+    "set mqtt_port <1..65535>   - MQTT port\r\n"
+    "set mqtt_id ID             - MQTT clientId\r\n"
+    "set mqtt_user user         - MQTT uživatel\r\n"
+    "set mqtt_pass password     - MQTT heslo (použijte \"\" pro mezery)\r\n"
+    "set mqtt_base topic        - MQTT base topic\r\n"
+    "set mqtt_ha 0|1            - Home Assistant autodiscovery\r\n"
+    "set mqtt_lox 0|1           - Loxone autodiscovery\r\n"
     "save / load                - ulozit / nacist z FS\r\n"
     "portal                     - spustit WiFi portal\r\n"
     "aq run                     - spustit AutoQNH nyni\r\n"
@@ -1329,13 +1735,78 @@ static void cliHandleLine(const String& line){
       } else Serial.println(F("ERR: ICAO must be 4 chars"));
       return;
     }
+    if (key=="mqtt_en" && isInt(val)){
+      CFG.mqtt_enable = (uint8_t)(val.toInt()!=0);
+      ensureMqttDefaults(); mqttOnConfigChanged();
+      Serial.printf("OK: mqtt_en=%u\r\n", (unsigned)CFG.mqtt_enable);
+      return;
+    }
+    if (key=="mqtt_host"){
+      CFG.mqtt_host = val; CFG.mqtt_host.trim();
+      ensureMqttDefaults(); mqttOnConfigChanged();
+      Serial.printf("OK: mqtt_host='%s'\r\n", CFG.mqtt_host.c_str());
+      return;
+    }
+    if (key=="mqtt_port" && isInt(val)){
+      long p = val.toInt(); if (p<1) p=1; if (p>65535) p=65535;
+      CFG.mqtt_port = (uint16_t)p;
+      ensureMqttDefaults(); mqttOnConfigChanged();
+      Serial.printf("OK: mqtt_port=%ld\r\n", p);
+      return;
+    }
+    if (key=="mqtt_id"){
+      CFG.mqtt_clientId = val;
+      CFG.mqtt_clientId.trim();
+      ensureMqttDefaults(); mqttOnConfigChanged();
+      Serial.printf("OK: mqtt_id='%s'\r\n", CFG.mqtt_clientId.c_str());
+      return;
+    }
+    if (key=="mqtt_user"){
+      CFG.mqtt_username = val;
+      CFG.mqtt_username.trim();
+      ensureMqttDefaults(); mqttOnConfigChanged();
+      Serial.printf("OK: mqtt_user='%s'\r\n", CFG.mqtt_username.c_str());
+      return;
+    }
+    if (key=="mqtt_pass"){
+      int idx = line.indexOf("mqtt_pass");
+      String pass = (idx>=0)? line.substring(idx+9) : val;
+      pass.trim();
+      if (pass.length() && pass[0]=='"'){
+        int q2 = pass.lastIndexOf('"');
+        pass = (q2>0)? pass.substring(1,q2) : pass.substring(1);
+      }
+      CFG.mqtt_password = pass;
+      ensureMqttDefaults(); mqttOnConfigChanged();
+      Serial.println(F("OK: mqtt_pass set"));
+      return;
+    }
+    if (key=="mqtt_base"){
+      CFG.mqtt_baseTopic = val;
+      CFG.mqtt_baseTopic.trim();
+      ensureMqttDefaults(); mqttOnConfigChanged();
+      Serial.printf("OK: mqtt_base='%s'\r\n", CFG.mqtt_baseTopic.c_str());
+      return;
+    }
+    if (key=="mqtt_ha" && isInt(val)){
+      CFG.mqtt_ha_discovery = (uint8_t)(val.toInt()!=0);
+      ensureMqttDefaults(); mqttOnConfigChanged();
+      Serial.printf("OK: mqtt_ha=%u\r\n", (unsigned)CFG.mqtt_ha_discovery);
+      return;
+    }
+    if (key=="mqtt_lox" && isInt(val)){
+      CFG.mqtt_loxone_discovery = (uint8_t)(val.toInt()!=0);
+      ensureMqttDefaults(); mqttOnConfigChanged();
+      Serial.printf("OK: mqtt_lox=%u\r\n", (unsigned)CFG.mqtt_loxone_discovery);
+      return;
+    }
     Serial.println(F("ERR: unknown key (see 'help')"));
     return;
   }
 
   if (cmd=="save"){ if (saveConfigFS()){ Serial.println(F("OK: config saved")); } else Serial.println(F("ERR: save failed")); return; }
-  if (cmd=="load"){ if (loadConfigFS()){ applyConfigToModbusMirror(); Serial.println(F("OK: config loaded")); } else Serial.println(F("ERR: load failed")); return; }
-  if (cmd=="reboot"){ Serial.println(F("Rebooting...")); delay(100); ESP.restart(); return; }
+  if (cmd=="load"){ if (loadConfigFS()){ applyConfigToModbusMirror(); ensureMqttDefaults(); mqttOnConfigChanged(); Serial.println(F("OK: config loaded")); } else Serial.println(F("ERR: load failed")); return; }
+  if (cmd=="reboot"){ Serial.println(F("Rebooting...")); mqttPublishAvailability(false); delay(100); ESP.restart(); return; }
 
   if (cmd=="portal"){ startPortal(); Serial.println(F("OK: portal started")); return; }
   if (cmd=="aq" && argc>=2 && args[1]=="run"){ Serial.println(F("AQ: run now")); autoQNH_RunOnce(); return; }
@@ -1389,6 +1860,8 @@ void setup(){
   if(!LittleFS.begin()){ Serial.println(F("LittleFS mount FAILED, formatting...")); LittleFS.format(); LittleFS.begin(); }
   resetToDefaultLocation();
   loadConfigFS();
+  ensureMqttDefaults();
+  mqttOnConfigChanged();
   updateLocationFromConfig();
   WiFi.hostname(CFG.deviceName);
   setupWiFi();
@@ -1437,8 +1910,10 @@ void loop(){
 
   if(WiFi.status()==WL_CONNECTED) mb.task();
 
+  mqttLoop();
+
   // Modbus příkazy přes registry
-  if(mb.Hreg(100)==1){ DLOG("[CMD] save&reboot\r\n"); saveConfigFS(); mb.Hreg(100,0); delay(100); ESP.restart(); }
+  if(mb.Hreg(100)==1){ DLOG("[CMD] save&reboot\r\n"); saveConfigFS(); mb.Hreg(100,0); mqttPublishAvailability(false); delay(100); ESP.restart(); }
   if(mb.Hreg(101)==1){ i2cScan(); }
   if(mb.Hreg(102)==1){ sensorSelfTest(); }
 

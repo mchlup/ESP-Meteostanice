@@ -66,6 +66,9 @@
 #include <SparkFunHTU21D.h>
 #include <ModbusIP_ESP8266.h>
 #include <math.h>
+#include <time.h>
+#include <stdlib.h>
+#include <ctype.h>
 
 // ----------------------------- DEBUG ------------------------------------------
 #define DEBUG 1
@@ -233,6 +236,56 @@ uint32_t lastAutoQNH_ms = 0;
 uint16_t mbEchoToken = 0;
 uint32_t mbEchoLastMs = 0;
 
+// ----------------------------- Lokace & slunce --------------------------------
+enum { LOC_PRIORITY_DEFAULT = 0, LOC_PRIORITY_GEO = 1, LOC_PRIORITY_MANUAL = 2 };
+static const float DEFAULT_LAT = 50.0755f;
+static const float DEFAULT_LON = 14.4378f;
+
+struct GeoCache {
+  bool   valid = false;
+  float  lat   = DEFAULT_LAT;
+  float  lon   = DEFAULT_LON;
+  String label = "Praha";
+};
+
+static float  g_locationLat = DEFAULT_LAT;
+static float  g_locationLon = DEFAULT_LON;
+static bool   g_locationValid = false;
+static uint8_t g_locationPriority = LOC_PRIORITY_DEFAULT;
+static String g_locationLabel = "Praha (výchozí)";
+static String g_locationSource = "Výchozí";
+static GeoCache g_geoCache;
+
+static time_t g_sunrise_ts = 0;
+static time_t g_sunset_ts  = 0;
+static bool   g_sunTimesValid = false;
+static uint32_t g_lastSunCalcMs = 0;
+
+static int   g_bioIndex = -1;
+static float g_bioScore = 0.0f;
+static float g_pressureTrendPaPerHour = 0.0f;
+static uint32_t g_lastPressurePa = 0;
+static uint32_t g_lastPressureMs = 0;
+static String g_bioLabel = "Bez dat";
+static String g_bioComment = "Čekám na stabilní měření.";
+
+static void setLocation(float lat, float lon, const String& label, const String& source, uint8_t priority){
+  if (!isfinite(lat) || !isfinite(lon)) return;
+  if (priority < g_locationPriority) return;
+  g_locationLat = lat;
+  g_locationLon = lon;
+  g_locationLabel = label;
+  g_locationSource = source;
+  g_locationPriority = priority;
+  g_locationValid = true;
+  g_sunTimesValid = false; // přepočet při dalším dotazu
+}
+
+static void resetToDefaultLocation(){
+  g_locationPriority = LOC_PRIORITY_DEFAULT;
+  setLocation(DEFAULT_LAT, DEFAULT_LON, String("Praha (výchozí)"), String("Výchozí"), LOC_PRIORITY_DEFAULT);
+}
+
 // ----------------------------- Helpers ----------------------------------------
 static inline void fromUint32Split(uint32_t v, uint16_t &hi, uint16_t &lo){ hi=uint16_t((v>>16)&0xFFFF); lo=uint16_t(v&0xFFFF); }
 static inline void writeU32ToRegs(uint16_t regHi, uint32_t v){ uint16_t hi,lo; fromUint32Split(v,hi,lo); mb.Hreg(regHi,hi); mb.Hreg(regHi+1,lo); }
@@ -285,6 +338,126 @@ bool loadConfigFS(){
   strlcpy(aqManualICAOBuf, CFG.autoQNH_manual_icao, sizeof(aqManualICAOBuf));
   return true;
 }
+
+static bool icaoEquals(const char* a, const char* b){
+  if (!a || !b) return false;
+  for (uint8_t i=0;i<4;i++){
+    char ca = toupper((unsigned char)a[i]);
+    char cb = toupper((unsigned char)b[i]);
+    if (ca != cb) return false;
+    if (ca == '\0' || cb == '\0') break;
+  }
+  return true;
+}
+
+static bool g_timeSyncInit = false;
+
+static void initTimeSync(){
+  if (g_timeSyncInit) return;
+  setenv("TZ","CET-1CEST,M3.5.0/2,M10.5.0/3",1);
+  tzset();
+  configTime(0, 0, "pool.ntp.org", "time.google.com", "time.cloudflare.com");
+  g_timeSyncInit = true;
+}
+
+static bool isTimeValid(){
+  time_t now = time(nullptr);
+  return now > 1609459200; // 1.1.2021 jako hranice
+}
+
+static inline float sinDeg(float deg){ return sinf(deg * DEG_TO_RAD); }
+static inline float cosDeg(float deg){ return cosf(deg * DEG_TO_RAD); }
+static inline float tanDeg(float deg){ return tanf(deg * DEG_TO_RAD); }
+static inline float acosDeg(float x){
+  if (x < -1.0f) x = -1.0f;
+  if (x >  1.0f) x =  1.0f;
+  return RAD_TO_DEG * acosf(x);
+}
+
+static bool computeSunEvent(time_t nowLocal, float lat, float lon, bool sunrise, time_t &eventOut){
+  struct tm lt;
+  if (!localtime_r(&nowLocal, &lt)) return false;
+  int N = lt.tm_yday + 1;
+  float lngHour = lon / 15.0f;
+  float approx = sunrise ? 6.0f : 18.0f;
+  float t = N + ((approx - lngHour) / 24.0f);
+  float M = 0.9856f * t - 3.289f;
+  float L = M + 1.916f * sinDeg(M) + 0.020f * sinDeg(2.0f * M) + 282.634f;
+  L = fmodf(L, 360.0f);
+  if (L < 0) L += 360.0f;
+
+  float RA = RAD_TO_DEG * atanf(0.91764f * tanDeg(L));
+  RA = fmodf(RA, 360.0f);
+  if (RA < 0) RA += 360.0f;
+
+  float Lquadrant = floorf(L / 90.0f) * 90.0f;
+  float RAquadrant = floorf(RA / 90.0f) * 90.0f;
+  RA = (RA + (Lquadrant - RAquadrant)) / 15.0f;
+
+  float sinDec = 0.39782f * sinDeg(L);
+  float cosDec = cosf(asinf(sinDec));
+  float cosH = (cosDeg(90.833f) - sinDec * sinDeg(lat)) / (cosDec * cosDeg(lat));
+  if (cosH > 1.0f) return false; // nikdy nevychází
+  if (cosH < -1.0f) return false; // nikdy nezapadá
+
+  float H = sunrise ? (360.0f - acosDeg(cosH)) : acosDeg(cosH);
+  H /= 15.0f;
+
+  float T = H + RA - 0.06571f * t - 6.622f;
+  float UT = fmodf(T - lngHour, 24.0f);
+  if (UT < 0) UT += 24.0f;
+
+  struct tm gmt;
+  gmtime_r(&nowLocal, &gmt);
+  time_t gmAsLocal = mktime(&gmt);
+  float tzOffsetHours = (float)difftime(nowLocal, gmAsLocal) / 3600.0f;
+
+  float localHours = UT + tzOffsetHours;
+  while (localHours < 0) localHours += 24.0f;
+  while (localHours >= 24.0f) localHours -= 24.0f;
+
+  struct tm dayLocal = lt;
+  dayLocal.tm_hour = 0; dayLocal.tm_min = 0; dayLocal.tm_sec = 0;
+  time_t midnight = mktime(&dayLocal);
+
+  int hour = (int)floorf(localHours);
+  float minF = (localHours - hour) * 60.0f;
+  int minute = (int)floorf(minF);
+  int second = (int)lroundf((minF - minute) * 60.0f);
+
+  dayLocal.tm_hour = hour;
+  dayLocal.tm_min = minute;
+  dayLocal.tm_sec = second;
+  eventOut = mktime(&dayLocal);
+  return true;
+}
+
+static void updateSunTimesIfNeeded(){
+  if (!g_locationValid) return;
+  if (!isTimeValid()) return;
+  uint32_t nowMs = millis();
+  if (g_sunTimesValid && (nowMs - g_lastSunCalcMs) < 60000UL) return;
+
+  time_t nowLocal = time(nullptr);
+  time_t sunrise=0, sunset=0;
+  bool riseOk = computeSunEvent(nowLocal, g_locationLat, g_locationLon, true, sunrise);
+  bool setOk  = computeSunEvent(nowLocal, g_locationLat, g_locationLon, false, sunset);
+  if (riseOk && setOk){
+    g_sunrise_ts = sunrise;
+    g_sunset_ts = sunset;
+    g_sunTimesValid = true;
+  } else {
+    g_sunTimesValid = false;
+  }
+  g_lastSunCalcMs = nowMs;
+}
+
+static bool lookupAirportByICAO(const char* icao, float &lat, float &lon, String &name);
+static void updateLocationFromConfig();
+static void initTimeSync();
+static bool computeSunEvent(time_t nowLocal, float lat, float lon, bool sunrise, time_t &eventOut);
+static void updateSunTimesIfNeeded();
+static void updateBioForecast();
 
 bool g_httpStarted = false;
 
@@ -362,6 +535,7 @@ void applyParamsFromWM(){
   String icao = String(p_aqmc.getValue()); icao.trim(); icao.toUpperCase();
   if (icao.length()==4){ strlcpy(CFG.autoQNH_manual_icao, icao.c_str(), sizeof(CFG.autoQNH_manual_icao)); }
   else { CFG.autoQNH_manual_icao[0]='\0'; if (CFG.autoQNH_manual_en) CFG.autoQNH_manual_en=0; }
+  updateLocationFromConfig();
 }
 
 // ----------------------------- Derived calc (Td, AH, VPD, Tv) ----------------
@@ -387,6 +561,73 @@ static inline float virtTemp_K_from_TRH_P(float T_C, float RH, uint32_t p_Pa){
   float e  = (RH/100.0f) * es_Pa(T_C); // Pa
   float q  = eps*e / (p_Pa - (1.0f - eps)*e);
   return T_K * (1.0f + 0.61f*q);
+}
+
+static void updateBioForecast(){
+  if (isnan(g_htu_t) || isnan(g_htu_h) || g_bmp_p == 0){
+    g_bioIndex = -1;
+    g_bioScore = 0.0f;
+    g_bioLabel = "Bez dat";
+    g_bioComment = "Čekám na stabilní měření.";
+    return;
+  }
+
+  float temp = g_htu_t;
+  float rh = clampf(g_htu_h, 0.0f, 100.0f);
+  float pressure_hpa = g_bmp_p / 100.0f;
+  float score = 0.0f;
+
+  if (temp < 5.0f || temp > 26.0f) score += 0.6f;
+  if (temp < -5.0f || temp > 30.0f) score += 0.8f;
+  if (temp < -12.0f || temp > 35.0f) score += 0.9f;
+
+  if (rh < 35.0f || rh > 75.0f) score += 0.5f;
+  if (rh < 25.0f || rh > 85.0f) score += 0.7f;
+  if (rh < 15.0f || rh > 95.0f) score += 0.9f;
+
+  if (pressure_hpa < 995.0f || pressure_hpa > 1035.0f) score += 0.4f;
+  if (pressure_hpa < 985.0f || pressure_hpa > 1040.0f) score += 0.4f;
+
+  float trend_hpa = g_pressureTrendPaPerHour / 100.0f;
+  float trendAbs = fabsf(trend_hpa);
+  if (trendAbs > 1.5f) score += 0.4f;
+  if (trendAbs > 3.0f) score += 0.4f;
+
+  float vpd_kpa = es_Pa(temp) * (1.0f - rh/100.0f) / 1000.0f;
+  if (vpd_kpa > 2.0f) score += 0.3f;
+  if (vpd_kpa > 3.0f) score += 0.3f;
+
+  g_bioScore = score;
+  int idx;
+  if (score < 0.8f) idx = 0;
+  else if (score < 1.6f) idx = 1;
+  else if (score < 2.5f) idx = 2;
+  else idx = 3;
+  g_bioIndex = idx;
+
+  switch (idx) {
+    case 0:
+      g_bioLabel = "Nízká";
+      g_bioComment = "Pohodové podmínky pro většinu populace.";
+      break;
+    case 1:
+      g_bioLabel = "Střední";
+      g_bioComment = "Mírná zátěž – citlivější osoby mohou pociťovat únavu.";
+      break;
+    case 2:
+      g_bioLabel = "Vysoká";
+      g_bioComment = "Zvýšená zátěž – doporučen odpočinek a pitný režim.";
+      break;
+    default:
+      g_bioLabel = "Extrémní";
+      g_bioComment = "Výrazná zátěž – omezte zátěž a sledujte zdravotní stav.";
+      break;
+  }
+
+  if (trendAbs > 1.5f){
+    g_bioComment += String(" Tlak se mění ") + (trend_hpa >= 0 ? "vzestupně" : "sestupně") +
+                    String(" (") + String(trend_hpa, 1) + " hPa/h).";
+  }
 }
 
 // Hypsometrie: ALT z QNH (m)
@@ -586,6 +827,20 @@ void pollAndPublishSensors(){
     uint32_t lx=(lux>4294967040.0f)?4294967040u:(uint32_t)lroundf(lux); writeU32ToRegs(15,lx);
   }
 
+  uint32_t nowMs = millis();
+  if (g_bmp_p > 0){
+    if (g_lastPressurePa != 0 && g_lastPressureMs != 0){
+      float dt_h = (nowMs - g_lastPressureMs) / 3600000.0f;
+      if (dt_h >= 0.01f){
+        g_pressureTrendPaPerHour = ((int32_t)g_bmp_p - (int32_t)g_lastPressurePa) / dt_h;
+      }
+    }
+    g_lastPressurePa = g_bmp_p;
+    g_lastPressureMs = nowMs;
+  }
+
+  updateBioForecast();
+
   // Derived: Td, AH, VPD
   if (!isnan(g_htu_t) && !isnan(g_htu_h)){
     float Td  = dewPointC(g_htu_t, g_htu_h);
@@ -701,17 +956,59 @@ void handleFlashIRQ(){
 }
 
 // ----------------------------- AutoQNH: whitelist METAR letišť (CZ) ----------
-struct Airport { const char* icao; float lat; float lon; };
+struct Airport { const char* icao; float lat; float lon; const char* name; };
 static const Airport CZ_AIRPORTS[] PROGMEM = {
-  {"LKPD", 50.013f, 15.738f}, // Pardubice
-  {"LKPR", 50.101f, 14.260f}, // Praha
-  {"LKTB", 49.151f, 16.695f}, // Brno
-  {"LKMT", 49.696f, 18.111f}, // Ostrava
-  {"LKKV", 50.203f, 12.915f}, // Karlovy Vary
-  {"LKPO", 49.427f, 17.405f}, // Přerov
-  {"LKCS", 48.946f, 14.427f}, // České Budějovice
+  {"LKPD", 50.013f, 15.738f, "Pardubice"},
+  {"LKPR", 50.101f, 14.260f, "Praha"},
+  {"LKTB", 49.151f, 16.695f, "Brno"},
+  {"LKMT", 49.696f, 18.111f, "Ostrava"},
+  {"LKKV", 50.203f, 12.915f, "Karlovy Vary"},
+  {"LKPO", 49.427f, 17.405f, "Přerov"},
+  {"LKCS", 48.946f, 14.427f, "České Budějovice"},
 };
 static const uint8_t CZ_AIRPORTS_N = sizeof(CZ_AIRPORTS)/sizeof(CZ_AIRPORTS[0]);
+
+static bool lookupAirportByICAO(const char* icao, float &lat, float &lon, String &name){
+  if (!icao) return false;
+  for (uint8_t i=0;i<CZ_AIRPORTS_N;i++){
+    Airport a; memcpy_P(&a, &CZ_AIRPORTS[i], sizeof(Airport));
+    if (icaoEquals(icao, a.icao)){
+      lat = a.lat; lon = a.lon;
+      name = String(a.icao) + " (" + String(a.name) + ")";
+      return true;
+    }
+  }
+  return false;
+}
+
+static void applyGeoFallback(){
+  if (g_geoCache.valid){
+    setLocation(g_geoCache.lat, g_geoCache.lon, g_geoCache.label, String("GeoIP"), LOC_PRIORITY_GEO);
+  } else {
+    resetToDefaultLocation();
+  }
+}
+
+static void updateLocationFromConfig(){
+  if (CFG.autoQNH_manual_en && strlen(CFG.autoQNH_manual_icao)==4){
+    float lat=DEFAULT_LAT, lon=DEFAULT_LON; String label;
+    if (lookupAirportByICAO(CFG.autoQNH_manual_icao, lat, lon, label)){
+      setLocation(lat, lon, label, String("Manuální ICAO"), LOC_PRIORITY_MANUAL);
+      return;
+    }
+  }
+
+  if (g_locationPriority == LOC_PRIORITY_MANUAL){
+    // manuální lokace deaktivována → vrať GeoIP / výchozí
+    g_locationPriority = LOC_PRIORITY_GEO;
+    applyGeoFallback();
+    return;
+  }
+
+  if (!g_locationValid){
+    applyGeoFallback();
+  }
+}
 
 static inline float toRad(float d){ return d * 0.017453292519943295f; }
 static float haversine_km(float lat1, float lon1, float lat2, float lon2){
@@ -825,6 +1122,15 @@ void autoQNH_RunOnce(){
   float lat=NAN, lon=NAN; String city;
   if (!geoLocateIP(lat, lon, city)){ DLOG("[AQ] Geolocate FAIL\r\n"); mb.Hreg(45, AQ_ERR_GEO); return; }
 
+  g_geoCache.valid = true;
+  g_geoCache.lat = lat;
+  g_geoCache.lon = lon;
+  g_geoCache.label = city.length() ? city : String("GeoIP lokalita");
+  if (g_locationPriority <= LOC_PRIORITY_GEO){
+    String src = String("GeoIP");
+    setLocation(lat, lon, g_geoCache.label, src, LOC_PRIORITY_GEO);
+  }
+
   // 3) Hledání nejbližších + fallback (zkusíme všechna let.)
   bool tried[CZ_AIRPORTS_N]; memset(tried, 0, sizeof(tried));
   uint32_t qnh=0; char icao[5]=""; uint16_t dist10=0;
@@ -854,6 +1160,13 @@ void autoQNH_RunOnce(){
   mb.Hreg(46, dist10);
   writeU32ToRegs(49, (millis()-bootMillis)/1000u);
   mb.Hreg(45, AQ_OK);
+
+  if (g_locationPriority <= LOC_PRIORITY_GEO){
+    Airport a; memcpy_P(&a, &CZ_AIRPORTS[successIdx], sizeof(Airport));
+    String src = String("GeoIP + ") + String(icao);
+    String label = g_geoCache.label.length() ? g_geoCache.label : String(a.icao);
+    setLocation(lat, lon, label, src, LOC_PRIORITY_GEO);
+  }
 
   DLOG("[AQ] %s: QNH=%lu Pa, dist=%.1f km, city='%s'\r\n",
        icao, (unsigned long)qnh, dist10/10.0f, city.c_str());
@@ -930,6 +1243,7 @@ static void applyConfigToModbusMirror(){
   mb.Hreg(51,(uint16_t)CFG.autoQNH_manual_en);
   if (strlen(CFG.autoQNH_manual_icao)==4) writeICAOToRegs(52,53,CFG.autoQNH_manual_icao);
   WiFi.hostname(CFG.deviceName); // uplatni se po reconnectu
+  updateLocationFromConfig();
 }
 
 #include "HttpApiUi.h"
@@ -1073,9 +1387,12 @@ void setup(){
   pinMode(FLASH_BTN_PIN,INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(FLASH_BTN_PIN), isrFlash, FALLING);
   if(!LittleFS.begin()){ Serial.println(F("LittleFS mount FAILED, formatting...")); LittleFS.format(); LittleFS.begin(); }
+  resetToDefaultLocation();
   loadConfigFS();
+  updateLocationFromConfig();
   WiFi.hostname(CFG.deviceName);
   setupWiFi();
+  initTimeSync();
   httpTryStart();
   httpInstallUI();   // ← přidá /ui (a přesměrování z "/") + /api/*
   //sensorsPowerInit();
@@ -1156,6 +1473,8 @@ void loop(){
     lastElev = elevNow; lastQNH = qnhNow; lastMode = CFG.altMode;
     lastAQen = CFG.autoQNH_enable; lastAQph = CFG.autoQNH_period_h; lastAQme = CFG.autoQNH_manual_en;
     strlcpy(lastAQmc, CFG.autoQNH_manual_icao, sizeof(lastAQmc));
+
+    updateLocationFromConfig();
 
     DLOG("[CFG] Live: Elev=%d m, QNH=%lu Pa, AltMode=%u, AutoQNH=%u/%uh, ManualICAO=%u '%s'\r\n",
          (int)elevNow, (unsigned long)qnhNow, (unsigned)CFG.altMode,

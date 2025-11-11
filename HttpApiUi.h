@@ -166,6 +166,20 @@ static const char UI_HTML[] PROGMEM = R"HTML(
       </div>
 
       <div class="card">
+        <div class="section-title">Slunce &amp; BIO</div>
+        <div class="kv">
+          <div>Lokalita</div><div id="locationLabel">—</div>
+          <div>Zdroj</div><div id="locationSource">—</div>
+          <div>Souřadnice</div><div id="locationCoords">—</div>
+          <div>Východ slunce</div><div id="sunrise">—</div>
+          <div>Západ slunce</div><div id="sunset">—</div>
+          <div>BIO zátěž</div><div><span id="bioLevel" class="pill">—</span></div>
+          <div>Trend tlaku</div><div id="pressureTrend">—</div>
+        </div>
+        <div class="callout" id="bioHint">Zátěž —</div>
+      </div>
+
+      <div class="card">
         <div class="section-title">Síť &amp; systém</div>
         <div class="kv kv-wide">
           <div>Stav Wi-Fi</div><div id="wifiStatus">—</div>
@@ -354,7 +368,10 @@ const fmt={
   aqResult:v=>AQ_RESULTS[v]||`Kód ${v}`,
   wifi:ok=>ok?'Připojeno':'Odpojeno',
   signal:rssi=>{if(rssi==null||isNaN(rssi))return'—'; return `${rssi} dBm`;},
-  signalQuality:rssi=>{if(rssi==null||isNaN(rssi))return'—'; if(rssi>=-55)return'Výborný'; if(rssi>=-65)return'Dobrý'; if(rssi>=-75)return'Uspokojivý'; if(rssi>=-85)return'Hranice'; return'Slabý';}
+  signalQuality:rssi=>{if(rssi==null||isNaN(rssi))return'—'; if(rssi>=-55)return'Výborný'; if(rssi>=-65)return'Dobrý'; if(rssi>=-75)return'Uspokojivý'; if(rssi>=-85)return'Hranice'; return'Slabý';},
+  timeHM:ts=>{if(ts==null||ts<=0)return'—'; const d=new Date(ts*1000); if(isNaN(d))return'—'; return d.toLocaleTimeString('cs-CZ',{hour:'2-digit',minute:'2-digit'});},
+  coords:(lat,lon)=>{if(!Number.isFinite(lat)||!Number.isFinite(lon))return'—'; return `${lat.toFixed(3)}°, ${lon.toFixed(3)}°`;},
+  trend:v=>{if(v==null||isNaN(v))return'—'; return `${v>=0?'+':''}${v.toFixed(1)} hPa/h`;}
 };
 
 function setSensorBadge(el,label,ok){el.textContent=label;el.className='pill '+(ok?'ok':'err');}
@@ -418,6 +435,18 @@ async function refresh(){
     $('#ah').textContent=fmt.gm3(st.ah);
     $('#vpd').textContent=fmt.vpd(st.vpd);
     $('#icao').textContent=st.icao||'—';
+
+    $('#locationLabel').textContent=st.location_valid?(st.location_label||'—'):'—';
+    $('#locationSource').textContent=st.location_valid?(st.location_source||'—'):'—';
+    $('#locationCoords').textContent=st.location_valid?fmt.coords(st.location_lat,st.location_lon):'—';
+    $('#sunrise').textContent=fmt.timeHM(st.sunrise_ts);
+    $('#sunset').textContent=fmt.timeHM(st.sunset_ts);
+    const bioIdx=Number.isFinite(st.bio_index)?st.bio_index:-1;
+    const classes=['pill ok','pill warn','pill err','pill err'];
+    $('#bioLevel').className=(bioIdx>=0&&bioIdx<classes.length)?classes[bioIdx]:'pill';
+    $('#bioLevel').textContent=st.bio_label||'—';
+    $('#bioHint').textContent=st.bio_comment||'Zátěž zatím neznámá.';
+    $('#pressureTrend').textContent=fmt.trend(st.pressure_trend_hpa_h);
 
     const aqAge = st.aq_last_up_s ? (st.uptime_s||0) - st.aq_last_up_s : null;
     const aqAgeText = fmt.relative(aqAge);
@@ -581,7 +610,9 @@ static void apiStatus(){
   const bool wifiConnected = (WiFi.status() == WL_CONNECTED);
   const IPAddress ip = WiFi.localIP();
 
-  StaticJsonDocument<896> doc;
+  updateSunTimesIfNeeded();
+
+  StaticJsonDocument<1152> doc;
   doc["deviceName"] = CFG.deviceName;
   doc["fw_major"] = FW_MAJOR;
   doc["fw_minor"] = FW_MINOR;
@@ -615,6 +646,28 @@ static void apiStatus(){
   doc["ah"] = (uint32_t)H(41);
   doc["vpd"] = (uint32_t)H(42);
   doc["icao"] = icao;
+
+  doc["location_valid"] = g_locationValid;
+  if (g_locationValid){
+    doc["location_lat"] = g_locationLat;
+    doc["location_lon"] = g_locationLon;
+    doc["location_label"] = g_locationLabel;
+    doc["location_source"] = g_locationSource;
+  }
+
+  if (g_sunTimesValid){
+    doc["sunrise_ts"] = (uint32_t)g_sunrise_ts;
+    doc["sunset_ts"] = (uint32_t)g_sunset_ts;
+  } else {
+    doc["sunrise_ts"] = 0;
+    doc["sunset_ts"] = 0;
+  }
+
+  doc["bio_index"] = g_bioIndex;
+  doc["bio_score"] = g_bioScore;
+  doc["bio_label"] = g_bioLabel;
+  doc["bio_comment"] = g_bioComment;
+  doc["pressure_trend_hpa_h"] = g_pressureTrendPaPerHour / 100.0f;
 
   // AutoQNH info
   doc["aq_last_result"] = (uint32_t)H(45);

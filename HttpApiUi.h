@@ -190,6 +190,9 @@ static const char UI_HTML[] PROGMEM = R"HTML(
           <div>Režim výšky</div><div id="altmode">—</div>
           <div>Modbus Unit ID</div><div id="unitid">—</div>
           <div>FW verze</div><div id="fwVersion">—</div>
+          <div>MQTT stav</div><div id="mqttStatus">—</div>
+          <div>MQTT topic</div><div class="mono" id="mqttTopic">—</div>
+          <div>MQTT autodiscovery</div><div id="mqttDiscovery">—</div>
         </div>
       </div>
 
@@ -204,6 +207,10 @@ static const char UI_HTML[] PROGMEM = R"HTML(
           <div>AutoQNH</div><div id="cfgAutoQnh">—</div>
           <div>AutoQNH perioda</div><div id="cfgAutoQnhPeriod">—</div>
           <div>Manuální ICAO</div><div id="cfgAutoQnhManual">—</div>
+          <div>MQTT</div><div id="cfgMqttEnable">—</div>
+          <div>MQTT broker</div><div id="cfgMqttHost">—</div>
+          <div>MQTT topic</div><div id="cfgMqttTopic">—</div>
+          <div>MQTT autodiscovery</div><div id="cfgMqttDiscovery">—</div>
         </div>
       </div>
 
@@ -272,6 +279,37 @@ static const char UI_HTML[] PROGMEM = R"HTML(
           <input id="f_aq_man" type="checkbox">
         </label>
       </div>
+
+      <div class="card">
+        <div class="section-title">MQTT</div>
+        <label class="toggle">
+          <span class="toggle-label">MQTT povoleno<small>Publikuje hodnoty do brokeru a zajišťuje autodiscovery.</small></span>
+          <input id="f_mqtt_en" type="checkbox">
+        </label>
+        <div class="form-grid">
+          <label>Broker (host)<input id="f_mqtt_host" placeholder="mqtt.local"></label>
+          <label>Port<input id="f_mqtt_port" type="number" min="1" max="65535" placeholder="1883"></label>
+        </div>
+        <label>Základní topic<input id="f_mqtt_base" placeholder="meteostanice/esp"></label>
+        <label>Client ID<input id="f_mqtt_id" placeholder="ESP-Meteo"></label>
+        <div class="form-grid">
+          <label>Uživatel<input id="f_mqtt_user" placeholder=""></label>
+          <label>Heslo<input id="f_mqtt_pass" type="password" placeholder="(nezměněno)"></label>
+        </div>
+        <label class="toggle">
+          <span class="toggle-label">Vymazat uložené heslo<small>Při uložení odstraní heslo z konfigurace.</small></span>
+          <input id="f_mqtt_clear" type="checkbox">
+        </label>
+        <label class="toggle">
+          <span class="toggle-label">Home Assistant autodiscovery<small>Publikuje entity pro Home Assistant.</small></span>
+          <input id="f_mqtt_ha" type="checkbox">
+        </label>
+        <label class="toggle">
+          <span class="toggle-label">Loxone autodiscovery<small>Publikuje mapu témat kompatibilní s Loxone.</small></span>
+          <input id="f_mqtt_lox" type="checkbox">
+        </label>
+        <div class="callout" id="mqttPassHint">—</div>
+      </div>
     </div>
     <div class="btn-row" style="margin-top:14px">
       <button id="saveBtn" class="btn">Uložit do /config.json</button>
@@ -329,6 +367,7 @@ static const char UI_HTML[] PROGMEM = R"HTML(
       <ul class="feature-list">
         <li><strong>Měření &amp; Modbus TCP</strong>Teplota, vlhkost, tlak a osvětlení s mapováním do holding registrů 0-199.</li>
         <li><strong>AutoQNH</strong>Automatická lokalizace a stahování METAR zpráv s přepočtem QNH/ALT.</li>
+        <li><strong>MQTT integrace</strong>Plná konfigurace brokeru, Home Assistant i Loxone autodiscovery.</li>
         <li><strong>WiFiManager portál</strong>Modeless konfigurace dostupná krátkým stiskem tlačítka FLASH.</li>
         <li><strong>Diagnostika</strong>I²C scanner, self-test senzorů a Modbus echo test.</li>
         <li><strong>Self-test &amp; LED</strong>RGB/SINGLE LED vzory, autotest po startu a stavové badge.</li>
@@ -390,6 +429,10 @@ async function api(path,opt){const r=await fetch(path,opt); if(!r.ok)throw new E
 
 function updateAutoQnhInputs(){const en=$('#f_aq_en').checked; $('#f_aq_per').disabled=!en; $('#f_aq_icao').disabled=!en||!$('#f_aq_man').checked; $('#f_aq_man').disabled=!en;}
 
+function refreshMqttPassHint(){const hint=$('#mqttPassHint'); if(!hint)return; const stored=hint.dataset.stored==='1'; const enabled=$('#f_mqtt_en').checked; const cleared=$('#f_mqtt_clear').checked; const newPass=$('#f_mqtt_pass').value.length>0; let text; if(!enabled){text='MQTT je vypnuto.';} else if(cleared){text='Heslo bude při uložení vymazáno.';} else if(newPass){text='Nové heslo bude uloženo.';} else if(stored){text='Heslo je uloženo (ponechejte prázdné pro zachování).';} else {text='Heslo není nastaveno.';} hint.textContent=text;}
+
+function updateMqttInputs(){const en=$('#f_mqtt_en').checked; ['#f_mqtt_host','#f_mqtt_port','#f_mqtt_base','#f_mqtt_id','#f_mqtt_user','#f_mqtt_pass','#f_mqtt_clear','#f_mqtt_ha','#f_mqtt_lox'].forEach(sel=>{const el=$(sel); if(el) el.disabled=!en;}); const hint=$('#mqttPassHint'); if(hint) hint.style.opacity=en?1:0.6; refreshMqttPassHint();}
+
 async function refresh(){
   try{
     const st=await api('/api/status');
@@ -407,6 +450,10 @@ async function refresh(){
     $('#signalQuality').textContent=fmt.signalQuality(st.rssi);
     $('#uptime').textContent=fmt.up(st.uptime_s||0);
     $('#wifiStatus').textContent=fmt.wifi(st.wifi_ok);
+    const mqttSummary = st.mqtt_enabled ? (st.mqtt_status|| (st.mqtt_connected?'Připojeno':'Odpojeno')) : 'Vypnuto';
+    $('#mqttStatus').textContent=mqttSummary;
+    $('#mqttTopic').textContent=st.mqtt_enabled?(st.mqtt_baseTopic||'—'):'—';
+    $('#mqttDiscovery').textContent=st.mqtt_enabled?`HA ${st.mqtt_ha_discovery? 'ano':'ne'} • Loxone ${st.mqtt_loxone_discovery? 'ano':'ne'}`:'—';
     $('#altmode').textContent=ALT_MODE_LABELS[st.altMode]||`Režim ${st.altMode}`;
     $('#unitid').textContent=st.unitId??'—';
     $('#cfgName').textContent=st.deviceName||'—';
@@ -418,6 +465,10 @@ async function refresh(){
     $('#cfgAutoQnhPeriod').textContent=st.autoQNH_period_h?`${st.autoQNH_period_h} h`:'—';
     const manualIcao = (st.autoQNH_manual_icao||'').toString().trim();
     $('#cfgAutoQnhManual').textContent=st.autoQNH_manual_en ? (manualIcao ? `${manualIcao} (fix)` : 'Zapnuto (bez ICAO)') : 'Vypnuto';
+    $('#cfgMqttEnable').textContent=fmt.bool(!!st.mqtt_enabled);
+    $('#cfgMqttHost').textContent=st.mqtt_host?`${st.mqtt_host}:${st.mqtt_port||1883}`:'—';
+    $('#cfgMqttTopic').textContent=st.mqtt_baseTopic||'—';
+    $('#cfgMqttDiscovery').textContent=`HA ${st.mqtt_ha_discovery? 'ano':'ne'} / Loxone ${st.mqtt_loxone_discovery? 'ano':'ne'}`;
 
     $('#t_htu').textContent=fmt.cdeg(st.t_htu);
     $('#rh_htu').textContent=fmt.cperc(st.rh_htu);
@@ -466,6 +517,9 @@ async function refresh(){
     $('#subtitle').textContent='Chyba načítání /api/status';
     $('#wifiBadge').textContent='Wi-Fi —';
     $('#wifiBadge').className='badge';
+    $('#mqttStatus').textContent='—';
+    $('#mqttTopic').textContent='—';
+    $('#mqttDiscovery').textContent='—';
   }
 }
 
@@ -483,6 +537,18 @@ async function loadConfig(){
   $('#f_aq_man').checked=!!c.autoQNH_manual_en;
   $('#f_aq_icao').value=(c.autoQNH_manual_icao||'').toUpperCase();
   updateAutoQnhInputs();
+  $('#f_mqtt_en').checked=!!c.mqtt_enable;
+  $('#f_mqtt_host').value=c.mqtt_host||'';
+  $('#f_mqtt_port').value=c.mqtt_port||1883;
+  $('#f_mqtt_base').value=c.mqtt_baseTopic||'';
+  $('#f_mqtt_id').value=c.mqtt_clientId||'';
+  $('#f_mqtt_user').value=c.mqtt_username||'';
+  $('#f_mqtt_pass').value='';
+  $('#f_mqtt_clear').checked=false;
+  $('#f_mqtt_ha').checked=!!c.mqtt_ha_discovery;
+  $('#f_mqtt_lox').checked=!!c.mqtt_loxone_discovery;
+  const passHint=$('#mqttPassHint'); if(passHint){passHint.dataset.stored=c.mqtt_password_set?'1':'0';}
+  updateMqttInputs();
   $('#saveHint').textContent='Změny zatím neuloženy.';
 }
 
@@ -499,12 +565,26 @@ async function saveConfig(persist){
     autoQNH_period_h:+$('#f_aq_per').value,
     autoQNH_manual_en:$('#f_aq_man').checked?1:0,
     autoQNH_manual_icao:$('#f_aq_icao').value.trim().toUpperCase(),
+    mqtt_enable:$('#f_mqtt_en').checked?1:0,
+    mqtt_host:$('#f_mqtt_host').value.trim(),
+    mqtt_port:+$('#f_mqtt_port').value||0,
+    mqtt_baseTopic:$('#f_mqtt_base').value.trim(),
+    mqtt_clientId:$('#f_mqtt_id').value.trim(),
+    mqtt_username:$('#f_mqtt_user').value.trim(),
+    mqtt_ha_discovery:$('#f_mqtt_ha').checked?1:0,
+    mqtt_loxone_discovery:$('#f_mqtt_lox').checked?1:0,
     persist:!!persist
   };
+  const pass=$('#f_mqtt_pass').value;
+  if(pass.length) body.mqtt_password=pass;
+  if($('#f_mqtt_clear').checked) body.mqtt_password_clear=1;
   const r=await api('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-  $('#saveHint').textContent=r.msg||(persist?'Uloženo.':'Aplikováno.');
+  const msg=r.msg||(persist?'Uloženo.':'Aplikováno.');
+  $('#saveHint').textContent=msg;
   if(r.reboot)setTimeout(()=>location.reload(),1200);
-  refresh();
+  await refresh();
+  await loadConfig();
+  $('#saveHint').textContent=msg;
 }
 
 async function action(cmd){return api('/api/action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cmd})});}
@@ -568,6 +648,9 @@ async function boot(){
   $('#mbWriteBtn').onclick=mbWrite;
   $('#f_aq_en').addEventListener('change',updateAutoQnhInputs);
   $('#f_aq_man').addEventListener('change',updateAutoQnhInputs);
+  $('#f_mqtt_en').addEventListener('change',updateMqttInputs);
+  $('#f_mqtt_clear').addEventListener('change',refreshMqttPassHint);
+  $('#f_mqtt_pass').addEventListener('input',refreshMqttPassHint);
 
   await refresh();
   await loadConfig();
@@ -609,10 +692,11 @@ static void apiStatus(){
 
   const bool wifiConnected = (WiFi.status() == WL_CONNECTED);
   const IPAddress ip = WiFi.localIP();
+  const bool mqttConnected = CFG.mqtt_enable && g_mqttClient.connected();
 
   updateSunTimesIfNeeded();
 
-  StaticJsonDocument<1152> doc;
+  StaticJsonDocument<1536> doc;
   doc["deviceName"] = CFG.deviceName;
   doc["fw_major"] = FW_MAJOR;
   doc["fw_minor"] = FW_MINOR;
@@ -630,6 +714,17 @@ static void apiStatus(){
   doc["autoQNH_period_h"] = (unsigned)CFG.autoQNH_period_h;
   doc["autoQNH_manual_en"] = (unsigned)CFG.autoQNH_manual_en;
   doc["autoQNH_manual_icao"] = CFG.autoQNH_manual_icao;
+  doc["mqtt_enabled"] = (unsigned)CFG.mqtt_enable;
+  doc["mqtt_connected"] = mqttConnected;
+  doc["mqtt_status"] = g_mqttState.status;
+  doc["mqtt_host"] = CFG.mqtt_host;
+  doc["mqtt_port"] = (unsigned)CFG.mqtt_port;
+  doc["mqtt_baseTopic"] = CFG.mqtt_baseTopic;
+  doc["mqtt_clientId"] = CFG.mqtt_clientId;
+  doc["mqtt_ha_discovery"] = (unsigned)CFG.mqtt_ha_discovery;
+  doc["mqtt_loxone_discovery"] = (unsigned)CFG.mqtt_loxone_discovery;
+  doc["mqtt_last_state"] = g_mqttState.lastClientState;
+  doc["mqtt_availability_online"] = g_mqttState.availabilityOnline;
 
   // sensors + derived
   doc["htu_ok"] = htu_ok;
@@ -686,7 +781,7 @@ static void apiStatus(){
 
 // ---------- API: /api/config (GET/POST) ---------------------------------------
 static void apiConfigGet(){
-  StaticJsonDocument<384> doc;
+  StaticJsonDocument<640> doc;
   doc["deviceName"] = CFG.deviceName;
   doc["unitId"] = CFG.unitId;
   doc["pollMs"] = CFG.pollMs;
@@ -698,6 +793,15 @@ static void apiConfigGet(){
   doc["autoQNH_period_h"] = (unsigned)CFG.autoQNH_period_h;
   doc["autoQNH_manual_en"] = (unsigned)CFG.autoQNH_manual_en;
   doc["autoQNH_manual_icao"] = CFG.autoQNH_manual_icao;
+  doc["mqtt_enable"] = (unsigned)CFG.mqtt_enable;
+  doc["mqtt_host"] = CFG.mqtt_host;
+  doc["mqtt_port"] = (unsigned)CFG.mqtt_port;
+  doc["mqtt_clientId"] = CFG.mqtt_clientId;
+  doc["mqtt_username"] = CFG.mqtt_username;
+  doc["mqtt_baseTopic"] = CFG.mqtt_baseTopic;
+  doc["mqtt_ha_discovery"] = (unsigned)CFG.mqtt_ha_discovery;
+  doc["mqtt_loxone_discovery"] = (unsigned)CFG.mqtt_loxone_discovery;
+  doc["mqtt_password_set"] = CFG.mqtt_password.length() > 0;
   sendJSONDoc(doc);
 }
 
@@ -708,7 +812,7 @@ static bool readJsonBody(StaticJsonDocument<Capacity> &doc){
   return !err;
 }
 
-static void applyCfgFromJSON(const StaticJsonDocument<768>& d){
+static void applyCfgFromJSON(const StaticJsonDocument<1024>& d){
   if (d.containsKey("deviceName"))        CFG.deviceName = String((const char*)d["deviceName"]);
   if (d.containsKey("unitId"))            CFG.unitId = (uint16_t)(unsigned)d["unitId"];
   if (d.containsKey("pollMs"))            CFG.pollMs = (uint32_t)(unsigned long)d["pollMs"];
@@ -722,12 +826,27 @@ static void applyCfgFromJSON(const StaticJsonDocument<768>& d){
   if (d.containsKey("autoQNH_manual_icao")){
     const char* s = d["autoQNH_manual_icao"]; if (s && strlen(s)==4) strlcpy(CFG.autoQNH_manual_icao, s, sizeof(CFG.autoQNH_manual_icao));
   }
+  if (d.containsKey("mqtt_enable"))       CFG.mqtt_enable = (uint8_t)(unsigned)d["mqtt_enable"];
+  if (d.containsKey("mqtt_host"))         CFG.mqtt_host = String((const char*)d["mqtt_host"]);
+  if (d.containsKey("mqtt_port"))         CFG.mqtt_port = (uint16_t)(unsigned)d["mqtt_port"];
+  if (d.containsKey("mqtt_clientId"))     CFG.mqtt_clientId = String((const char*)d["mqtt_clientId"]);
+  if (d.containsKey("mqtt_username"))     CFG.mqtt_username = String((const char*)d["mqtt_username"]);
+  if (d.containsKey("mqtt_password_clear") && d["mqtt_password_clear"]) CFG.mqtt_password = "";
+  if (d.containsKey("mqtt_password")) {
+    const char* pw = d["mqtt_password"];
+    if (pw) CFG.mqtt_password = String(pw);
+  }
+  if (d.containsKey("mqtt_baseTopic"))    CFG.mqtt_baseTopic = String((const char*)d["mqtt_baseTopic"]);
+  if (d.containsKey("mqtt_ha_discovery")) CFG.mqtt_ha_discovery = (uint8_t)(unsigned)d["mqtt_ha_discovery"];
+  if (d.containsKey("mqtt_loxone_discovery")) CFG.mqtt_loxone_discovery = (uint8_t)(unsigned)d["mqtt_loxone_discovery"];
   // promítnout do Modbus mirroru i hostname
   applyConfigToModbusMirror();
+  ensureMqttDefaults();
+  mqttOnConfigChanged();
 }
 
 static void apiConfigPost(){
-  StaticJsonDocument<768> d;
+  StaticJsonDocument<1024> d;
   if(!readJsonBody(d)) return sendErr(400,"bad json");
 
   bool persist = d["persist"] | false;
@@ -761,6 +880,7 @@ static void apiActionPost(){
     resp["ok"] = true;
     resp["reboot"] = true;
     sendJSONDoc(resp);
+    mqttPublishAvailability(false);
     delay(200);
     ESP.restart();
     return;

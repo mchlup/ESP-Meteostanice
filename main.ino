@@ -493,7 +493,7 @@ bool loadConfigFS(){
 // ----------------------------- MQTT -------------------------------------------
 static bool mqttPublishNumber(const String& topic, float value, uint8_t decimals, bool retain = true){
   if (!topic.length() || !isfinite(value)) return false;
-  String payload = String(value, decimals);
+  String payload = String(value, static_cast<unsigned int>(decimals));
   payload.replace(',', '.');
   return g_mqttClient.publish(topic.c_str(), payload.c_str(), retain);
 }

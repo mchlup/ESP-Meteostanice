@@ -1468,7 +1468,7 @@ static bool geoLocateIP(float &lat, float &lon, String &city){
   return !(isnan(lat) || isnan(lon));
 }
 
-// METAR z NOAA TGFTP -> QNH v Pa (Qxxxx nebo Axxxx) — Nyní přes HTTPS
+// METAR z NOAA TGFTP -> QNH v Pa (Qxxxx nebo Axxxx) — HTTP (bez TLS)
 static bool metarQNH_Pa_from_NOAA(const char* icao, uint32_t &qnh_pa_out){
   String url = String("http://tgftp.nws.noaa.gov/data/observations/metar/stations/") + icao + ".TXT";
   String body;
@@ -1478,26 +1478,37 @@ static bool metarQNH_Pa_from_NOAA(const char* icao, uint32_t &qnh_pa_out){
   String metar = (nl>=0 && nl+1 < (int)body.length()) ? body.substring(nl+1) : body;
   metar.trim();
 
+  // QNH ve formátu Qxxxx (hPa)
   int idx = metar.indexOf(" Q");
   if (idx >= 0 && idx+6 <= (int)metar.length()){
     String s = metar.substring(idx+2, idx+6);
     if (s.length()==4 && s.charAt(0)>='0'){
-      int q = s.toInt(); if (q>800 && q<1100){ qnh_pa_out = (uint32_t)q * 100U; return true; }
+      int q = s.toInt(); 
+      if (q>800 && q<1100){ 
+        qnh_pa_out = (uint32_t)q * 100U; 
+        return true; 
+      }
     }
   }
+
+  // Alternativně Axxxx (inHg)
   idx = metar.indexOf(" A");
   if (idx >= 0 && idx+6 <= (int)metar.length()){
     String s = metar.substring(idx+2, idx+6);
     if (s.length()==4 && s.charAt(0)>='0'){
       int a = s.toInt(); // 2992 => 29.92 inHg
       float inHg = a / 100.0f;
-      float hPa = inHg * 33.8639f;
+      float hPa  = inHg * 33.8639f;
       uint32_t Pa = (uint32_t)lroundf(hPa * 100.0f);
-      if (Pa>80000 && Pa<110000){ qnh_pa_out = Pa; return true; }
+      if (Pa>80000 && Pa<110000){ 
+        qnh_pa_out = Pa; 
+        return true; 
+      }
     }
   }
   return false;
 }
+
 void modbusSetICAO(const char* icao){ writeICAOToRegs(47,48,icao); }
 
 // ----------------------------- AutoQNH: hlavní procedura ----------------------

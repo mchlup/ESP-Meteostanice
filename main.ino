@@ -1425,21 +1425,32 @@ static int nearestIdxNotTried(float lat, float lon, const bool* tried){
   return best;
 }
 
-// ----------------------------- AutoQNH: HTTP utility --------------------------
+  // ----------------------------- AutoQNH: HTTP utility --------------------------
+static const uint16_t AUTOQNH_HTTP_TIMEOUT_MS = 5000;   // bylo 10000
+static const uint8_t  AUTOQNH_MAX_METAR_TRIES = 4;      // max počet letišť, které zkusíme
+
 static bool httpGET(const String& url, String& out){
   HTTPClient http;
-  http.setTimeout(10000);
+  http.setTimeout(AUTOQNH_HTTP_TIMEOUT_MS);
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
 
   WiFiClient client;
-  if (!http.begin(client, url)) return false;
+  if (!http.begin(client, url)) {
+    DLOG("[HTTP] begin() FAIL %s\r\n", url.c_str());
+    return false;
+  }
 
   int code = http.GET();
   bool ok = (code == HTTP_CODE_OK);
-  if (ok) out = http.getString();
-  else DLOG("[HTTP] GET fail %s (code=%d)\r\n", url.c_str(), code);
+  if (ok) {
+    out = http.getString();
+  } else {
+    DLOG("[HTTP] GET fail %s (code=%d)\r\n", url.c_str(), code);
+  }
 
   http.end();
+  yield();  // aby se nakrmil watchdog hlavně na ESP8266
+
   return ok;
 }
 

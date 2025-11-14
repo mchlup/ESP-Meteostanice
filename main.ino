@@ -72,7 +72,7 @@
 #include <ctype.h>
 
 // ----------------------------- DEBUG ------------------------------------------
-#define DEBUG 1
+#define DEBUG 0
 static const uint32_t DEBUG_INTERVAL_MS = 10000;
 #if DEBUG
   #define DLOG(...)  do { Serial.printf(__VA_ARGS__); } while(0)
@@ -1079,7 +1079,8 @@ void setupWiFi(){
 void reinitI2C(){
   // ESP8266: TwoWire nemá end(), prosté znovu-inicializování sběrnice
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
-  Wire.setClock(400000);
+  delay(15);
+  Wire.setClock(100000);
 
   // re-init senzorů na sběrnici
   bh_ok  = bh1750.begin(BH1750::CONTINUOUS_HIGH_RES_MODE);
@@ -1106,7 +1107,13 @@ static void sensorsPowerOff(){
 
 void setupSensors(){
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);  // SDA=GPIO4(D2), SCL=GPIO5(D1) na ESP-Witty
-  Wire.setClock(400000);
+  Wire.setClock(100000);
+  delay(30);
+
+  Wire.beginTransmission(0x40);
+Wire.write(0xFE); // soft reset
+Wire.endTransmission();
+delay(15);
 
   htu.begin();                  // SparkFun HTU21D: begin() je void
   { float t=htu.readTemperature(), h=htu.readHumidity();

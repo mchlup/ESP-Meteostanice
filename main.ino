@@ -36,24 +36,23 @@
 #if defined(ARDUINO_ARCH_ESP32)
   #include <WebServer.h>
   WebServer server(80);
-#else
-  #include <ESP8266WebServer.h>
-  ESP8266WebServer server(80);
-#endif
-
-// === ESP32-C3 PORT: platform guardy ===
-#if defined(ARDUINO_ARCH_ESP32)
   #include <WiFi.h>
   #include <WiFiClient.h>
   //#include <WiFiClientSecure.h>
   #include <HTTPClient.h>
+  //#include <ModbusIP_ESP32.h>
+  #include <ModbusIP_ESP8266.h>
   #define ISR_ATTR IRAM_ATTR
 #else
+  #include <ESP8266WebServer.h>
+  ESP8266WebServer server(80);
   #include <ESP8266WiFi.h>
   #include <WiFiClient.h>
   //#include <WiFiClientSecure.h>
   #include <ESP8266HTTPClient.h>
+  #include <ModbusIP_ESP8266.h>
   #define ISR_ATTR ICACHE_RAM_ATTR
+  #define WIFI_TX_POWER_DBM        17.0f
 #endif
 
 #include <WiFiManager.h>
@@ -64,7 +63,7 @@
 #include <BH1750.h>
 #include <Adafruit_BMP085.h>
 #include <SparkFunHTU21D.h>
-#include <ModbusIP_ESP8266.h>
+//#include <ModbusIP_ESP8266.h>
 #include <PubSubClient.h>
 #include <math.h>
 #include <time.h>
@@ -86,7 +85,7 @@ static const uint32_t DEBUG_INTERVAL_MS = 10000;
 #if defined(ARDUINO_ARCH_ESP32)
   // nic – řeší se v setupWiFi()
 #else
-  #define WIFI_TX_POWER_DBM        17.0f
+  
 #endif
 // ----------------------------- I2C PINY (ESP8266 Witty) -----------------------
 #ifndef I2C_SDA_PIN

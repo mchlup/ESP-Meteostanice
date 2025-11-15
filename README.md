@@ -14,7 +14,8 @@ Projekt obsahuje firmware pro meteostanici postavenou na ESP8266 nebo ESP32-C3. 
 ```
 .
 ├── README.md        – Tento dokument
-├── HttpApiUi.h      – HTML/JS UI a REST API obslužný kód
+├── data/            – Obsah LittleFS (SPA UI v `ui/index.html`)
+├── HttpApiUi.h      – REST API a obsluha HTTP serveru
 └── main.ino         – Hlavní firmware, senzory, Modbus a logika AutoQNH
 ```
 
@@ -29,6 +30,7 @@ Projekt obsahuje firmware pro meteostanici postavenou na ESP8266 nebo ESP32-C3. 
    - `emelianov/Modbus-ESP8266`
 3. V nastavení projektu zvolte příslušnou desku (ESP8266/ESP32-C3) a správný port.
 4. Nahrajte firmware do zařízení.
+5. Nahrajte obsah adresáře `data/` do LittleFS (Arduino IDE: nástroj *ESP8266 LittleFS Data Upload* / *ESP32 Sketch Data Upload*, PlatformIO: `pio run -t uploadfs`).
 
 > **Tip:** Pro ESP32-C3 doporučuji nastavit `I2C_SDA_PIN` a `I2C_SCL_PIN` na 8/9, případně upravit definice v `main.ino` podle použité desky.
 
@@ -47,6 +49,8 @@ Projekt obsahuje firmware pro meteostanici postavenou na ESP8266 nebo ESP32-C3. 
 - Tab „Přehled“ zobrazuje aktuální hodnoty senzorů, odvozené veličiny a stav sítě.
 - Tab „Nastavení“ dovoluje měnit konfiguraci. Změny lze uložit do flash (`persist=true`) nebo pouze dočasně aplikovat.
 - Tab „Nástroje“ nabízí diagnostické akce (I2C scan, self-test, ruční spuštění AutoQNH, reboot).
+
+> HTML/JS front-end je uložený v LittleFS (`data/ui/index.html`), takže jej můžete upravovat a nahrávat nezávisle na firmware.
 
 ### REST API
 | Endpoint | Metoda | Popis |

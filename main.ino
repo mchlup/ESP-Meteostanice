@@ -38,7 +38,7 @@
   WebServer server(80);
   #include <WiFi.h>
   #include <WiFiClient.h>
-  //#include <WiFiClientSecure.h>
+  #include <WiFiClientSecure.h>
   #include <HTTPClient.h>
   //#include <ModbusIP_ESP32.h>
   #include <ModbusIP_ESP8266.h>
@@ -48,7 +48,7 @@
   ESP8266WebServer server(80);
   #include <ESP8266WiFi.h>
   #include <WiFiClient.h>
-  //#include <WiFiClientSecure.h>
+  #include <WiFiClientSecure.h>
   #include <ESP8266HTTPClient.h>
   #include <ModbusIP_ESP8266.h>
   #define ISR_ATTR ICACHE_RAM_ATTR
@@ -1433,14 +1433,26 @@ static bool httpGET(const String& url, String& out){
   http.setTimeout(AUTOQNH_HTTP_TIMEOUT_MS);
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
 
-  WiFiClient client;
-  if (!http.begin(client, url)) {
+  const bool useHttps = url.startsWith("https://");
+  WiFiClient plainClient;
+  WiFiClientSecure secureClient;
+  WiFiClient* clientPtr = nullptr;
+
+  if (useHttps) {
+    secureClient.setInsecure();
+    clientPtr = &secureClient;
+  } else {
+    clientPtr = &plainClient;
+  }
+
+  if (!clientPtr || !http.begin(*clientPtr, url)) {
     DLOG("[HTTP] begin() FAIL %s\r\n", url.c_str());
     return false;
   }
 
   int code = http.GET();
   bool ok = (code == HTTP_CODE_OK);
+
   if (ok) {
     out = http.getString();
   } else {
@@ -1467,11 +1479,17 @@ static bool geoLocateIP(float &lat, float &lon, String &city){
   return !(isnan(lat) || isnan(lon));
 }
 
-// METAR z NOAA TGFTP -> QNH v Pa (Qxxxx nebo Axxxx) — HTTP (bez TLS)
+// METAR z NOAA TGFTP -> QNH v Pa (Qxxxx nebo Axxxx) – přednostně HTTPS
 static bool metarQNH_Pa_from_NOAA(const char* icao, uint32_t &qnh_pa_out){
-  String url = String("http://tgftp.nws.noaa.gov/data/observations/metar/stations/") + icao + ".TXT";
+  const String path = String("tgftp.nws.noaa.gov/data/observations/metar/stations/") + icao + ".TXT";
   String body;
-  if (!httpGET(url, body)) return false;
+
+  String httpsUrl = String("https://") + path;
+  if (!httpGET(httpsUrl, body)){
+    DLOG("[AQ] HTTPS METAR fallback -> HTTP (%s)\r\n", icao);
+    String httpUrl = String("http://") + path;
+    if (!httpGET(httpUrl, body)) return false;
+  }
 
   int nl = body.indexOf('\n');
   String metar = (nl>=0 && nl+1 < (int)body.length()) ? body.substring(nl+1) : body;

@@ -288,6 +288,21 @@ static void apiMBPost(){
   StaticJsonDocument<64> resp; resp["ok"] = true; sendJSONDoc(resp);
 }
 
+// ---------- API: /api/airports -------------------------------------------------
+static void apiAirports(){
+  StaticJsonDocument<768> doc;
+  JsonArray arr = doc.createNestedArray("airports");
+  for (uint8_t i = 0; i < CZ_AIRPORTS_N; ++i) {
+    Airport a; memcpy_P(&a, &CZ_AIRPORTS[i], sizeof(Airport));
+    JsonObject obj = arr.createNestedObject();
+    obj["icao"] = String(a.icao);
+    obj["name"] = String(a.name);
+    obj["lat"] = a.lat;
+    obj["lon"] = a.lon;
+  }
+  sendJSONDoc(doc);
+}
+
 // ---------- Mount routes + SPA ------------------------------------------------
 void httpInstallUI(){
   // SPA
@@ -304,6 +319,7 @@ void httpInstallUI(){
   server.on("/api/action", HTTP_POST, apiActionPost);
   server.on("/api/mb", HTTP_GET, apiMBGet);
   server.on("/api/mb", HTTP_POST, apiMBPost);
+  server.on("/api/airports", HTTP_GET, apiAirports);
 
   server.onNotFound([](){
     if (httpTryServeStatic(server.uri())) return;

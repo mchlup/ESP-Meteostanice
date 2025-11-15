@@ -69,6 +69,7 @@
 #include <time.h>
 #include <stdlib.h>
 #include <ctype.h>
+#include <vector>
 
 // ----------------------------- DEBUG ------------------------------------------
 #define DEBUG 0
@@ -304,6 +305,8 @@ static void mqttPublishHaDiscovery();
 static void mqttPublishLoxoneDiscovery();
 static void mqttPublishHaClear();
 static void mqttPublishLoxoneClear();
+static void calibrationMaybeStoreSample();
+static void updateWeatherForecastFromHistory();
 
 // ----------------------------- WiFiManager params -----------------------------
 WiFiManager wm;
@@ -346,6 +349,27 @@ float   g_htu_h = NAN;   // %
 float   g_bmp_t = NAN;   // °C
 uint32_t g_bmp_p = 0;    // Pa
 float   g_bh_lux = NAN;  // lx
+
+// ----------------------------- Kalibrace & predikce ---------------------------
+static const char* const CALIBRATION_PATH = "/calibration.csv";
+static time_t   g_lastCalibrationHour = 0;
+static uint32_t g_lastCalibrationCheckMs = 0;
+static uint32_t g_lastCalibrationStoreMs = 0;
+static uint32_t g_lastSensorSampleMs = 0;
+
+static bool   g_forecastValid = false;
+static float  g_forecastTemp1h = NAN;
+static float  g_forecastTemp3h = NAN;
+static float  g_forecastHumidity1h = NAN;
+static float  g_forecastHumidity3h = NAN;
+static float  g_forecastPressure1h = NAN;
+static float  g_forecastPressure3h = NAN;
+static float  g_forecastLux1h = NAN;
+static float  g_forecastLux3h = NAN;
+static time_t g_forecastGeneratedTs = 0;
+static String g_forecastSummary = "Predikce nedostupná";
+static String g_forecastDetail = "Čekám na kalibrační data.";
+static String g_forecastConfidence = "Neznámá";
 
 // ----------------------------- LED stavové flagy ------------------------------
 bool g_i2cScanActive  = false;
@@ -1018,6 +1042,273 @@ static void updateBioForecast(){
   }
 }
 
+// ----------------------------- Kalibrační soubor & predikce ------------------
+struct CalibrationSample {
+  time_t ts = 0;
+  float  tempC = NAN;
+  float  humidity = NAN;
+  float  pressure_hpa = NAN;
+  float  lux = NAN;
+};
+
+struct Regression {
+  double n = 0.0;
+  double sumX = 0.0;
+  double sumY = 0.0;
+  double sumXX = 0.0;
+  double sumXY = 0.0;
+
+  void add(double x, double y){
+    n += 1.0;
+    sumX += x;
+    sumY += y;
+    sumXX += x * x;
+    sumXY += x * y;
+  }
+
+  bool ready() const { return n >= 2.0; }
+
+  double slope() const {
+    double denom = n * sumXX - sumX * sumX;
+    if (fabs(denom) < 1e-9) return 0.0;
+    return (n * sumXY - sumX * sumY) / denom;
+  }
+
+  double intercept(double slopeVal) const {
+    if (n == 0.0) return 0.0;
+    return (sumY - slopeVal * sumX) / n;
+  }
+
+  float predict(double x, float fallback) const {
+    if (!ready()) return fallback;
+    double m = slope();
+    double b = intercept(m);
+    return (float)(b + m * x);
+  }
+};
+
+static inline void resetForecastOutputs(){
+  g_forecastTemp1h = g_forecastTemp3h = NAN;
+  g_forecastHumidity1h = g_forecastHumidity3h = NAN;
+  g_forecastPressure1h = g_forecastPressure3h = NAN;
+  g_forecastLux1h = g_forecastLux3h = NAN;
+}
+
+static bool parseCalibrationLine(const String& line, CalibrationSample& out){
+  if (!line.length()) return false;
+  if (line.startsWith(F("timestamp"))) return false;
+
+  int year, month, day, hour, minute, second;
+  float temp, humidity, lux;
+  unsigned long pressurePa;
+  int matched = sscanf(line.c_str(), "%d-%d-%dT%d:%d:%d;%f;%f;%lu;%f",
+                      &year, &month, &day, &hour, &minute, &second,
+                      &temp, &humidity, &pressurePa, &lux);
+  if (matched != 10) return false;
+
+  struct tm tmLocal;
+  memset(&tmLocal, 0, sizeof(tmLocal));
+  tmLocal.tm_year = year - 1900;
+  tmLocal.tm_mon  = month - 1;
+  tmLocal.tm_mday = day;
+  tmLocal.tm_hour = hour;
+  tmLocal.tm_min  = minute;
+  tmLocal.tm_sec  = second;
+  time_t ts = mktime(&tmLocal);
+  if (ts <= 0) return false;
+
+  out.ts = ts;
+  out.tempC = temp;
+  out.humidity = humidity;
+  out.pressure_hpa = (float)pressurePa / 100.0f;
+  out.lux = lux;
+  return true;
+}
+
+static void updateWeatherForecastFromHistory(){
+  resetForecastOutputs();
+
+  std::vector<CalibrationSample> samples;
+  samples.reserve(168);
+
+  if (!LittleFS.exists(CALIBRATION_PATH)){
+    g_forecastValid = false;
+    g_forecastSummary = "Predikce nedostupná";
+    g_forecastDetail = "Kalibrační soubor zatím neexistuje.";
+    g_forecastConfidence = "Neznámá";
+    g_forecastGeneratedTs = 0;
+    g_lastCalibrationHour = 0;
+    return;
+  }
+
+  File f = LittleFS.open(CALIBRATION_PATH, "r");
+  if (!f){
+    g_forecastValid = false;
+    g_forecastSummary = "Predikce nedostupná";
+    g_forecastDetail = "Kalibrační soubor nelze otevřít.";
+    g_forecastConfidence = "Neznámá";
+    g_forecastGeneratedTs = 0;
+    g_lastCalibrationHour = 0;
+    return;
+  }
+
+  while (f.available()){
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (!line.length()) continue;
+    CalibrationSample sample;
+    if (parseCalibrationLine(line, sample)){
+      samples.push_back(sample);
+      if (samples.size() > 168) samples.erase(samples.begin());
+    }
+  }
+  f.close();
+
+  if (samples.empty()){
+    g_forecastValid = false;
+    g_forecastSummary = "Predikce nedostupná";
+    g_forecastDetail = "Kalibrační soubor neobsahuje použitelné záznamy.";
+    g_forecastConfidence = "Neznámá";
+    g_forecastGeneratedTs = 0;
+    g_lastCalibrationHour = 0;
+    return;
+  }
+
+  g_forecastGeneratedTs = samples.back().ts;
+  g_lastCalibrationHour = g_forecastGeneratedTs - (g_forecastGeneratedTs % 3600);
+
+  const size_t MIN_SAMPLES = 6;
+  if (samples.size() < MIN_SAMPLES){
+    g_forecastValid = false;
+    g_forecastSummary = "Nedostatek dat";
+    g_forecastDetail = "Pro predikci je potřeba alespoň 6 hodinových záznamů.";
+    float coverage = (float)((samples.back().ts - samples.front().ts) / 3600.0);
+    if (coverage < 0) coverage = 0;
+    g_forecastConfidence = "Velmi nízká";
+    if (coverage > 0){
+      g_forecastConfidence += String(" (") + String(coverage, 0) + " h dat)";
+    }
+    return;
+  }
+
+  Regression regTemp, regHum, regPress, regLux;
+  double baseTs = (double)samples.front().ts;
+  double lastX = 0.0;
+  for (const CalibrationSample& s : samples){
+    double x = ((double)s.ts - baseTs) / 3600.0;
+    regTemp.add(x, s.tempC);
+    regHum.add(x, s.humidity);
+    regPress.add(x, s.pressure_hpa);
+    regLux.add(x, s.lux);
+    lastX = x;
+  }
+
+  const CalibrationSample& last = samples.back();
+  auto predictValue = [](const Regression& reg, double x, float fallback, float lo, float hi){
+    float val = reg.predict(x, fallback);
+    if (!isfinite(val)) val = fallback;
+    return clampf(val, lo, hi);
+  };
+
+  double x1 = lastX + 1.0;
+  double x3 = lastX + 3.0;
+
+  g_forecastTemp1h = predictValue(regTemp, x1, last.tempC, -40.0f, 60.0f);
+  g_forecastTemp3h = predictValue(regTemp, x3, last.tempC, -40.0f, 60.0f);
+  g_forecastHumidity1h = predictValue(regHum, x1, last.humidity, 0.0f, 100.0f);
+  g_forecastHumidity3h = predictValue(regHum, x3, last.humidity, 0.0f, 100.0f);
+  g_forecastPressure1h = predictValue(regPress, x1, last.pressure_hpa, 800.0f, 1100.0f);
+  g_forecastPressure3h = predictValue(regPress, x3, last.pressure_hpa, 800.0f, 1100.0f);
+  g_forecastLux1h = predictValue(regLux, x1, last.lux, 0.0f, 200000.0f);
+  g_forecastLux3h = predictValue(regLux, x3, last.lux, 0.0f, 200000.0f);
+
+  float tempSlope = (float)regTemp.slope();
+  float pressSlope = (float)regPress.slope();
+  float humSlope = (float)regHum.slope();
+
+  String summary;
+  if (pressSlope > 0.35f) summary = "Zlepšení počasí (tlak stoupá)";
+  else if (pressSlope < -0.35f) summary = "Možné zhoršení (tlak klesá)";
+  else if (tempSlope > 0.4f) summary = "Postupné oteplení";
+  else if (tempSlope < -0.4f) summary = "Postupné ochlazení";
+  else summary = "Stabilní podmínky";
+
+  String detail = String("Za 1 h: T ") + String(g_forecastTemp1h, 1) + " °C, RH " +
+                  String(g_forecastHumidity1h, 1) + " %, tlak " +
+                  String(g_forecastPressure1h, 1) + " hPa, osvětlení " +
+                  String(g_forecastLux1h, 0) + " lx.";
+  detail += String(" Za 3 h: T ") + String(g_forecastTemp3h, 1) + " °C, RH " +
+            String(g_forecastHumidity3h, 1) + " %, tlak " +
+            String(g_forecastPressure3h, 1) + " hPa, osvětlení " +
+            String(g_forecastLux3h, 0) + " lx.";
+  detail += String(" Trend: tlak ") + (pressSlope >= 0 ? "+" : "") +
+            String(pressSlope, 2) + " hPa/h, teplota " +
+            (tempSlope >= 0 ? "+" : "") + String(tempSlope, 2) + " °C/h, vlhkost " +
+            (humSlope >= 0 ? "+" : "") + String(humSlope, 2) + " %/h.";
+
+  float coverageHours = (float)((samples.back().ts - samples.front().ts) / 3600.0);
+  if (coverageHours < 0) coverageHours = 0;
+  if (coverageHours >= 72.0f) g_forecastConfidence = "Vysoká";
+  else if (coverageHours >= 24.0f) g_forecastConfidence = "Střední";
+  else g_forecastConfidence = "Nižší";
+  g_forecastConfidence += String(" (") + String(coverageHours, 0) + " h dat)";
+
+  g_forecastSummary = summary;
+  g_forecastDetail = detail;
+  g_forecastValid = true;
+}
+
+static void calibrationMaybeStoreSample(){
+  uint32_t nowMs = millis();
+  if (nowMs - g_lastCalibrationCheckMs < 30000UL) return;
+  g_lastCalibrationCheckMs = nowMs;
+
+  if (!isTimeValid()) return;
+  if (isnan(g_htu_t) || isnan(g_htu_h) || g_bmp_p == 0) return;
+  if (g_lastSensorSampleMs == 0 || g_lastSensorSampleMs <= g_lastCalibrationStoreMs) return;
+
+  time_t now = time(nullptr);
+  if (now <= 0) return;
+  time_t hourTs = now - (now % 3600);
+  if (g_lastCalibrationHour != 0 && hourTs <= g_lastCalibrationHour) return;
+
+  float lux = isnan(g_bh_lux) ? 0.0f : g_bh_lux;
+
+  bool existed = LittleFS.exists(CALIBRATION_PATH);
+  File file = LittleFS.open(CALIBRATION_PATH, existed ? "a" : "w");
+#ifdef FILE_APPEND
+  if (!file && existed) file = LittleFS.open(CALIBRATION_PATH, FILE_APPEND);
+#endif
+  if (!file) return;
+
+  if (!existed){
+    file.println(F("timestamp;temperature_c;humidity_pct;pressure_pa;illuminance_lux"));
+  }
+
+  struct tm tmLocal;
+  if (!localtime_r(&now, &tmLocal)){
+    file.close();
+    return;
+  }
+
+  char timestamp[32];
+  size_t written = strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%S", &tmLocal);
+  if (!written){
+    file.close();
+    return;
+  }
+
+  char line[160];
+  snprintf(line, sizeof(line), "%s;%.2f;%.2f;%lu;%.2f",
+           timestamp, g_htu_t, g_htu_h, (unsigned long)g_bmp_p, lux);
+  file.println(line);
+  file.close();
+
+  g_lastCalibrationHour = hourTs;
+  g_lastCalibrationStoreMs = nowMs;
+  updateWeatherForecastFromHistory();
+}
+
 // Hypsometrie: ALT z QNH (m)
 static inline float altitude_from_QNH_m(uint32_t p_Pa, float T_C, float RH, uint32_t qnh_Pa){
   if (!p_Pa || !qnh_Pa) return 0.0f;
@@ -1286,6 +1577,9 @@ void pollAndPublishSensors(){
   mqttPublishState(false);
   mb.Hreg(0,computeStatus());
   writeU32ToRegs(20,(millis()-bootMillis)/1000u);
+
+  g_lastSensorSampleMs = millis();
+  calibrationMaybeStoreSample();
 }
 
 // ----------------------------- Periodický DEBUG -------------------------------
@@ -1906,6 +2200,7 @@ void setup(){
   if(!LittleFS.begin()){ Serial.println(F("LittleFS mount FAILED, formatting...")); LittleFS.format(); LittleFS.begin(); }
   resetToDefaultLocation();
   loadConfigFS();
+  updateWeatherForecastFromHistory();
   ensureMqttDefaults();
   mqttOnConfigChanged();
   updateLocationFromConfig();
@@ -2035,6 +2330,8 @@ void loop(){
   debugLogPeriodic();
   httpTryStart();     // pokud se Wi-Fi připojí až později
   server.handleClient();
+
+  calibrationMaybeStoreSample();
 
   yield();
 }

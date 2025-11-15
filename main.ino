@@ -71,6 +71,9 @@
 #include <ctype.h>
 #include <vector>
 
+// Předdeklarace pro generované prototypy Arduino preprocesoru
+struct CalibrationSample;
+
 // ----------------------------- DEBUG ------------------------------------------
 #define DEBUG 0
 static const uint32_t DEBUG_INTERVAL_MS = 10000;

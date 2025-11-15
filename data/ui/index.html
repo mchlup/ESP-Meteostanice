@@ -178,6 +178,20 @@
       </div>
 
       <div class="card">
+        <div class="section-title">Predikce počasí</div>
+        <div class="kv">
+          <div>Stav</div><div id="forecastSummary">—</div>
+          <div>Spolehlivost</div><div id="forecastConfidence">—</div>
+          <div>Aktualizace</div><div id="forecastUpdated">—</div>
+          <div>Teplota (+1 h / +3 h)</div><div id="forecastTemp">—</div>
+          <div>Vlhkost (+1 h / +3 h)</div><div id="forecastHumidity">—</div>
+          <div>Tlak (+1 h / +3 h)</div><div id="forecastPressure">—</div>
+          <div>Osvit (+1 h / +3 h)</div><div id="forecastLux">—</div>
+        </div>
+        <div class="callout" id="forecastHint">Predikce se připravuje – potřebujeme několik hodin dat.</div>
+      </div>
+
+      <div class="card">
         <div class="section-title">Síť &amp; systém</div>
         <div class="kv kv-wide">
           <div>Stav Wi-Fi</div><div id="wifiStatus">—</div>
@@ -398,10 +412,14 @@ const fmt={
   cdegShort:v=>v==null||isNaN(v)?'—':(v/100).toFixed(1)+' °C',
   cperc:v=>v==null||isNaN(v)?'—':(v/100).toFixed(2)+' %',
   cpercShort:v=>v==null||isNaN(v)?'—':(v/100).toFixed(1)+' %',
+  deg:v=>v==null||isNaN(v)?'—':Number(v).toFixed(1)+' °C',
+  percFloat:v=>v==null||isNaN(v)?'—':Number(v).toFixed(1)+' %',
   pa:v=>v==null||isNaN(v)?'—':Number(v).toLocaleString('cs-CZ')+' Pa',
   paShort:v=>v==null||isNaN(v)?'—':(v/100).toFixed(1)+' hPa',
+  hpaFloat:v=>v==null||isNaN(v)?'—':Number(v).toFixed(1)+' hPa',
   lux:v=>v==null||isNaN(v)?'—':Number(v).toLocaleString('cs-CZ')+' lx',
   luxShort:v=>{if(v==null||isNaN(v))return'—'; if(v>=1000)return (v/1000).toFixed(1)+' klx'; return Number(v).toLocaleString('cs-CZ')+' lx';},
+  luxFloat:v=>{if(v==null||isNaN(v))return'—'; if(Math.abs(v)>=1000)return (v/1000).toFixed(1)+' klx'; return Number(v).toLocaleString('cs-CZ')+' lx';},
   m:v=>v==null||isNaN(v)?'—':Number(v).toLocaleString('cs-CZ',{maximumFractionDigits:2})+' m',
   m0:v=>v==null||isNaN(v)?'—':Number(v).toLocaleString('cs-CZ',{maximumFractionDigits:0})+' m',
   gm3:v=>v==null||isNaN(v)?'—':(v/100).toFixed(2)+' g/m³',
@@ -416,7 +434,8 @@ const fmt={
   signalQuality:rssi=>{if(rssi==null||isNaN(rssi))return'—'; if(rssi>=-55)return'Výborný'; if(rssi>=-65)return'Dobrý'; if(rssi>=-75)return'Uspokojivý'; if(rssi>=-85)return'Hranice'; return'Slabý';},
   timeHM:ts=>{if(ts==null||ts<=0)return'—'; const d=new Date(ts*1000); if(isNaN(d))return'—'; return d.toLocaleTimeString('cs-CZ',{hour:'2-digit',minute:'2-digit'});},
   coords:(lat,lon)=>{if(!Number.isFinite(lat)||!Number.isFinite(lon))return'—'; return `${lat.toFixed(3)}°, ${lon.toFixed(3)}°`;},
-  trend:v=>{if(v==null||isNaN(v))return'—'; return `${v>=0?'+':''}${v.toFixed(1)} hPa/h`;}
+  trend:v=>{if(v==null||isNaN(v))return'—'; return `${v>=0?'+':''}${v.toFixed(1)} hPa/h`;},
+  dateTime:ts=>{if(ts==null||ts<=0)return'—'; const d=new Date(ts*1000); if(isNaN(d))return'—'; return d.toLocaleString('cs-CZ',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'});}
 };
 
 let AIRPORTS=null;
@@ -585,6 +604,16 @@ async function refresh(){
     $('#bioLevel').textContent=st.bio_label||'—';
     $('#bioHint').textContent=st.bio_comment||'Zátěž zatím neznámá.';
     $('#pressureTrend').textContent=fmt.trend(st.pressure_trend_hpa_h);
+
+    const fcValid=!!st.forecast_valid;
+    $('#forecastSummary').textContent=fcValid?(st.forecast_summary||'—'):'Predikce nedostupná';
+    $('#forecastConfidence').textContent=fcValid?(st.forecast_confidence||'—'):'—';
+    $('#forecastTemp').textContent=fcValid?`+1 h ${fmt.deg(st.forecast_temp_1h)} • +3 h ${fmt.deg(st.forecast_temp_3h)}`:'—';
+    $('#forecastHumidity').textContent=fcValid?`+1 h ${fmt.percFloat(st.forecast_humidity_1h)} • +3 h ${fmt.percFloat(st.forecast_humidity_3h)}`:'—';
+    $('#forecastPressure').textContent=fcValid?`+1 h ${fmt.hpaFloat(st.forecast_pressure_1h)} • +3 h ${fmt.hpaFloat(st.forecast_pressure_3h)}`:'—';
+    $('#forecastLux').textContent=fcValid?`+1 h ${fmt.luxFloat(st.forecast_lux_1h)} • +3 h ${fmt.luxFloat(st.forecast_lux_3h)}`:'—';
+    $('#forecastUpdated').textContent=fmt.dateTime(st.forecast_generated_ts);
+    $('#forecastHint').textContent=st.forecast_detail||'Predikce zatím není k dispozici.';
 
     const aqAge = st.aq_last_up_s ? (st.uptime_s||0) - st.aq_last_up_s : null;
     const aqAgeText = fmt.relative(aqAge);

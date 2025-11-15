@@ -78,7 +78,7 @@ static void apiStatus(){
 
   updateSunTimesIfNeeded();
 
-  StaticJsonDocument<1536> doc;
+  StaticJsonDocument<1920> doc;
   doc["deviceName"] = CFG.deviceName;
   doc["fw_major"] = FW_MAJOR;
   doc["fw_minor"] = FW_MINOR;
@@ -145,6 +145,20 @@ static void apiStatus(){
   doc["bio_label"] = g_bioLabel;
   doc["bio_comment"] = g_bioComment;
   doc["pressure_trend_hpa_h"] = g_pressureTrendPaPerHour / 100.0f;
+
+  doc["forecast_valid"] = g_forecastValid;
+  doc["forecast_summary"] = g_forecastSummary;
+  doc["forecast_detail"] = g_forecastDetail;
+  doc["forecast_confidence"] = g_forecastConfidence;
+  doc["forecast_generated_ts"] = g_forecastGeneratedTs ? (uint32_t)g_forecastGeneratedTs : 0;
+  if (isfinite(g_forecastTemp1h)) doc["forecast_temp_1h"] = g_forecastTemp1h; else doc["forecast_temp_1h"] = nullptr;
+  if (isfinite(g_forecastTemp3h)) doc["forecast_temp_3h"] = g_forecastTemp3h; else doc["forecast_temp_3h"] = nullptr;
+  if (isfinite(g_forecastHumidity1h)) doc["forecast_humidity_1h"] = g_forecastHumidity1h; else doc["forecast_humidity_1h"] = nullptr;
+  if (isfinite(g_forecastHumidity3h)) doc["forecast_humidity_3h"] = g_forecastHumidity3h; else doc["forecast_humidity_3h"] = nullptr;
+  if (isfinite(g_forecastPressure1h)) doc["forecast_pressure_1h"] = g_forecastPressure1h; else doc["forecast_pressure_1h"] = nullptr;
+  if (isfinite(g_forecastPressure3h)) doc["forecast_pressure_3h"] = g_forecastPressure3h; else doc["forecast_pressure_3h"] = nullptr;
+  if (isfinite(g_forecastLux1h)) doc["forecast_lux_1h"] = g_forecastLux1h; else doc["forecast_lux_1h"] = nullptr;
+  if (isfinite(g_forecastLux3h)) doc["forecast_lux_3h"] = g_forecastLux3h; else doc["forecast_lux_3h"] = nullptr;
 
   // AutoQNH info
   doc["aq_last_result"] = (uint32_t)H(45);

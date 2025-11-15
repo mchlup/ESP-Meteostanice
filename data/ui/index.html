@@ -55,10 +55,14 @@
   .btn:hover{filter:brightness(1.08);transform:translateY(-1px)}
   .btn.ghost{background:rgba(16,33,61,.6);color:#dbe8ff;border:1px solid rgba(71,108,168,.6);box-shadow:none}
   .btn.ghost:hover{background:rgba(78,168,255,.2);color:#001a3c}
+  .btn.small{padding:6px 10px;font-size:12px}
   .btn-row{display:flex;flex-wrap:wrap;gap:12px}
   table{width:100%;border-collapse:collapse;font-size:14px}
   th,td{padding:10px;border-bottom:1px solid rgba(41,63,104,.6);text-align:left}
   tbody tr:hover{background:rgba(13,22,38,.65)}
+  .airport-table tr.active{background:rgba(78,168,255,.18)}
+  .airport-table tr.active td{color:#fff;font-weight:600}
+  #aqAirportSection.disabled{opacity:.45;pointer-events:none}
   canvas{width:100%;height:200px;background:#0d1426;border-radius:14px;border:1px solid rgba(31,48,88,.75);box-shadow:inset 0 0 0 1px rgba(9,15,24,.8)}
   .callout{padding:14px 16px;border-radius:14px;border:1px solid rgba(78,168,255,.32);background:rgba(12,24,45,.75);font-size:13px;color:#cfe0ff}
   .feature-list{list-style:none;margin:0;padding:0;display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}
@@ -267,11 +271,19 @@
         <div class="form-grid">
           <label>Perioda (h)<input id="f_aq_per" type="number" min="1" max="255"></label>
           <label>Manuální ICAO (4 znaky)<input id="f_aq_icao" maxlength="4" placeholder="LKPR"></label>
+          <label>Výběr letiště<select id="f_aq_icao_select"><option value="">Načítám seznam…</option><option value="__custom">Vlastní ICAO</option></select></label>
         </div>
         <label class="toggle">
           <span class="toggle-label">Manuální ICAO povoleno<small>Fixuje vybrané letiště místo automatického výběru.</small></span>
           <input id="f_aq_man" type="checkbox">
         </label>
+        <div id="aqAirportSection">
+          <div class="callout" id="aqAirportHint">Načítám seznam letišť…</div>
+          <table class="airport-table">
+            <thead><tr><th>ICAO</th><th>Letiště</th><th>Poloha</th><th></th></tr></thead>
+            <tbody id="aqAirportTable"><tr><td colspan="4" class="muted">Načítám…</td></tr></tbody>
+          </table>
+        </div>
       </div>
 
       <div class="card">
@@ -407,6 +419,8 @@ const fmt={
   trend:v=>{if(v==null||isNaN(v))return'—'; return `${v>=0?'+':''}${v.toFixed(1)} hPa/h`;}
 };
 
+let AIRPORTS=null;
+
 function setSensorBadge(el,label,ok){el.textContent=label;el.className='pill '+(ok?'ok':'err');}
 
 let chartCtx; const chartData=[];
@@ -421,7 +435,77 @@ function drawChart(){const c=$('#chart'); const ctx=chartCtx; if(!ctx||!c)return
 
 async function api(path,opt){const r=await fetch(path,opt); if(!r.ok)throw new Error('HTTP '+r.status); const ct=r.headers.get('content-type')||''; return ct.includes('application/json')?r.json():r.text();}
 
-function updateAutoQnhInputs(){const en=$('#f_aq_en').checked; $('#f_aq_per').disabled=!en; $('#f_aq_icao').disabled=!en||!$('#f_aq_man').checked; $('#f_aq_man').disabled=!en;}
+function updateAutoQnhInputs(){
+  const en=$('#f_aq_en').checked;
+  const manualChecked=$('#f_aq_man').checked;
+  const manualEnabled=en&&manualChecked;
+  $('#f_aq_per').disabled=!en;
+  $('#f_aq_man').disabled=!en;
+  $('#f_aq_icao').disabled=!manualEnabled;
+  const sel=$('#f_aq_icao_select'); if(sel) sel.disabled=!manualEnabled;
+  const section=$('#aqAirportSection'); if(section) section.classList.toggle('disabled',!manualEnabled);
+}
+
+function findAirport(icao){if(!icao||!Array.isArray(AIRPORTS))return null; const code=icao.toUpperCase(); return AIRPORTS.find(a=>a.icao===code)||null;}
+
+function refreshManualAirportUI(){
+  const manualInput=$('#f_aq_icao');
+  const manual=(manualInput?manualInput.value:'').trim().toUpperCase();
+  const sel=$('#f_aq_icao_select');
+  const loading=!Array.isArray(AIRPORTS);
+  const airports=Array.isArray(AIRPORTS)?AIRPORTS:[];
+  if(sel){
+    if(loading){
+      sel.innerHTML='<option value="">Načítám seznam…</option><option value="__custom">Vlastní ICAO</option>';
+      sel.value=manual?'__custom':'';
+    }else{
+      const opts=['<option value="">Vyberte letiště…</option>'];
+      airports.forEach(a=>{opts.push(`<option value="${a.icao}">${a.icao} — ${a.name||'—'}</option>`);});
+      opts.push('<option value="__custom">Vlastní ICAO</option>');
+      sel.innerHTML=opts.join('');
+      if(manual&&findAirport(manual)) sel.value=manual; else if(manual) sel.value='__custom'; else sel.value='';
+    }
+  }
+  const tbody=$('#aqAirportTable');
+  if(tbody){
+    if(loading){
+      tbody.innerHTML='<tr><td colspan="4" class="muted">Načítám…</td></tr>';
+    }else if(!airports.length){
+      tbody.innerHTML='<tr><td colspan="4" class="muted">Seznam letišť není dostupný.</td></tr>';
+    }else{
+      tbody.innerHTML=airports.map(a=>{const active=manual&&manual===a.icao; const latVal=Number(a.lat); const lonVal=Number(a.lon); const latTxt=Number.isFinite(latVal)?latVal.toFixed(3)+'°':'—'; const lonTxt=Number.isFinite(lonVal)?lonVal.toFixed(3)+'°':'—'; return `<tr class="${active?'active':''}"><td class="mono">${a.icao}</td><td>${a.name||'—'}</td><td>${latTxt} / ${lonTxt}</td><td><button class="btn ghost small" data-icao="${a.icao}">Nastavit</button></td></tr>`;}).join('');
+    }
+  }
+  const hint=$('#aqAirportHint');
+  if(hint){
+    if(loading){
+      hint.textContent='Načítám seznam letišť…';
+    }else{
+      const manualEnabled=$('#f_aq_en').checked&&$('#f_aq_man').checked;
+      if(!manualEnabled){
+        hint.textContent='Povolte AutoQNH a manuální režim pro výběr letiště.';
+      }else if(manual){
+        const airport=findAirport(manual);
+        hint.textContent=airport?`Vybráno ${manual} – ${airport.name}.`:`Použito vlastní ICAO ${manual}.`;
+      }else{
+        hint.textContent='Zvolte letiště ze seznamu nebo zadejte vlastní ICAO.';
+      }
+    }
+  }
+}
+
+async function loadAirports(){
+  AIRPORTS=null;
+  refreshManualAirportUI();
+  try{
+    const data=await api('/api/airports');
+    const list=Array.isArray(data.airports)?data.airports:[];
+    AIRPORTS=list.map(a=>({icao:String(a.icao||'').toUpperCase(),name:a.name||'',lat:Number(a.lat),lon:Number(a.lon)}));
+  }catch(e){
+    AIRPORTS=[];
+  }
+  refreshManualAirportUI();
+}
 
 function refreshMqttPassHint(){const hint=$('#mqttPassHint'); if(!hint)return; const stored=hint.dataset.stored==='1'; const enabled=$('#f_mqtt_en').checked; const cleared=$('#f_mqtt_clear').checked; const newPass=$('#f_mqtt_pass').value.length>0; let text; if(!enabled){text='MQTT je vypnuto.';} else if(cleared){text='Heslo bude při uložení vymazáno.';} else if(newPass){text='Nové heslo bude uloženo.';} else if(stored){text='Heslo je uloženo (ponechejte prázdné pro zachování).';} else {text='Heslo není nastaveno.';} hint.textContent=text;}
 
@@ -457,8 +541,17 @@ async function refresh(){
     $('#cfgQnh').textContent=fmt.pa(st.cfgQNH_Pa);
     $('#cfgAutoQnh').textContent=fmt.bool(!!st.autoQNH_enable);
     $('#cfgAutoQnhPeriod').textContent=st.autoQNH_period_h?`${st.autoQNH_period_h} h`:'—';
-    const manualIcao = (st.autoQNH_manual_icao||'').toString().trim();
-    $('#cfgAutoQnhManual').textContent=st.autoQNH_manual_en ? (manualIcao ? `${manualIcao} (fix)` : 'Zapnuto (bez ICAO)') : 'Vypnuto';
+    const manualIcao = (st.autoQNH_manual_icao||'').toString().trim().toUpperCase();
+    let manualSummary='Vypnuto';
+    if(st.autoQNH_manual_en){
+      if(manualIcao){
+        const manualAirport=findAirport(manualIcao);
+        manualSummary=manualAirport?`${manualIcao} – ${manualAirport.name}`:`${manualIcao} (vlastní)`;
+      }else{
+        manualSummary='Zapnuto (bez ICAO)';
+      }
+    }
+    $('#cfgAutoQnhManual').textContent=manualSummary;
     $('#cfgMqttEnable').textContent=fmt.bool(!!st.mqtt_enabled);
     $('#cfgMqttHost').textContent=st.mqtt_host?`${st.mqtt_host}:${st.mqtt_port||1883}`:'—';
     $('#cfgMqttTopic').textContent=st.mqtt_baseTopic||'—';
@@ -543,6 +636,8 @@ async function loadConfig(){
   $('#f_mqtt_lox').checked=!!c.mqtt_loxone_discovery;
   const passHint=$('#mqttPassHint'); if(passHint){passHint.dataset.stored=c.mqtt_password_set?'1':'0';}
   updateMqttInputs();
+  updateAutoQnhInputs();
+  refreshManualAirportUI();
   $('#saveHint').textContent='Změny zatím neuloženy.';
 }
 
@@ -640,12 +735,54 @@ async function boot(){
   $('#applyBtn').onclick=()=>saveConfig(false);
   $('#mbReadBtn').onclick=mbRead;
   $('#mbWriteBtn').onclick=mbWrite;
-  $('#f_aq_en').addEventListener('change',updateAutoQnhInputs);
-  $('#f_aq_man').addEventListener('change',updateAutoQnhInputs);
+  $('#f_aq_en').addEventListener('change',()=>{updateAutoQnhInputs();refreshManualAirportUI();});
+  $('#f_aq_man').addEventListener('change',()=>{updateAutoQnhInputs();refreshManualAirportUI();});
   $('#f_mqtt_en').addEventListener('change',updateMqttInputs);
   $('#f_mqtt_clear').addEventListener('change',refreshMqttPassHint);
   $('#f_mqtt_pass').addEventListener('input',refreshMqttPassHint);
+  const aqIcaoInput=$('#f_aq_icao');
+  if(aqIcaoInput){
+    aqIcaoInput.addEventListener('input',e=>{
+      const start=e.target.selectionStart;
+      const end=e.target.selectionEnd;
+      const upper=e.target.value.toUpperCase();
+      if(e.target.value!==upper){
+        e.target.value=upper;
+        if(start!=null&&end!=null) e.target.setSelectionRange(start,end);
+      }
+      refreshManualAirportUI();
+    });
+  }
+  const aqSelect=$('#f_aq_icao_select');
+  if(aqSelect){
+    aqSelect.addEventListener('change',e=>{
+      const val=e.target.value;
+      if(val&&val!=='__custom'){
+        if(aqIcaoInput) aqIcaoInput.value=val;
+        $('#f_aq_man').checked=true;
+        updateAutoQnhInputs();
+        refreshManualAirportUI();
+      }else if(val==='__custom'&&aqIcaoInput){
+        aqIcaoInput.focus();
+      }
+    });
+  }
+  const aqTable=$('#aqAirportTable');
+  if(aqTable){
+    aqTable.addEventListener('click',e=>{
+      const btn=e.target.closest?e.target.closest('button[data-icao]'):null;
+      if(!btn)return;
+      e.preventDefault();
+      const code=btn.getAttribute('data-icao');
+      if(aqIcaoInput) aqIcaoInput.value=code;
+      $('#f_aq_man').checked=true;
+      updateAutoQnhInputs();
+      refreshManualAirportUI();
+    });
+  }
 
+  updateAutoQnhInputs();
+  await loadAirports();
   await refresh();
   await loadConfig();
   setInterval(refresh,4000);

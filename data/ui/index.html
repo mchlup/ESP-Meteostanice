@@ -22,6 +22,17 @@
   .tabs button:hover{background:rgba(78,168,255,.25);color:#001a3c}
   .tabs button.active{background:var(--acc);color:#001a3c;border-color:rgba(78,168,255,.8);box-shadow:0 8px 24px rgba(78,168,255,.35)}
   .hero-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:14px;margin-bottom:18px}
+  .forecast-hero{display:flex;flex-wrap:wrap;gap:20px;margin-bottom:20px;padding:22px;border-radius:22px;background:linear-gradient(135deg,rgba(78,168,255,.16),rgba(16,27,50,.92));border:1px solid rgba(78,168,255,.4);box-shadow:0 20px 40px rgba(3,7,15,.4)}
+  .forecast-hero.disabled{opacity:.6}
+  .forecast-hero .hero-left{flex:1 1 320px;min-width:280px;display:flex;flex-direction:column;gap:10px}
+  .forecast-hero .hero-left h2{margin:0;font-size:28px}
+  .forecast-hero .hero-detail{color:rgba(233,244,255,.85);font-size:14px}
+  .forecast-hero .hero-meta{display:flex;flex-wrap:wrap;gap:10px}
+  .forecast-hero .hero-right{flex:1 1 260px;display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px}
+  .forecast-stat{background:rgba(8,15,28,.65);border:1px solid rgba(78,168,255,.25);border-radius:16px;padding:14px 16px;display:flex;flex-direction:column;gap:4px}
+  .forecast-stat span{font-size:12px;letter-spacing:.08em;color:rgba(227,240,255,.72);text-transform:uppercase}
+  .forecast-stat strong{font-size:22px}
+  .forecast-stat small{color:var(--muted);font-size:12px}
   .mini-card{background:linear-gradient(160deg,rgba(78,168,255,.18),rgba(16,27,50,.9));border:1px solid rgba(78,168,255,.25);border-radius:16px;padding:16px 18px;display:flex;flex-direction:column;gap:6px;min-height:110px;box-shadow:0 12px 32px rgba(0,0,0,.25)}
   .mini-card:nth-child(2){background:linear-gradient(160deg,rgba(58,210,159,.18),rgba(16,27,50,.9));border-color:rgba(58,210,159,.3)}
   .mini-card:nth-child(3){background:linear-gradient(160deg,rgba(247,197,95,.18),rgba(16,27,50,.9));border-color:rgba(247,197,95,.28)}
@@ -110,6 +121,39 @@
   </nav>
 
   <section id="tab-dash">
+    <div class="forecast-hero" id="forecastHero">
+      <div class="hero-left">
+        <span class="mini-label">Krátkodobá predikce</span>
+        <h2 id="forecastHeroSummary">Predikce se připravuje…</h2>
+        <div class="hero-detail" id="forecastHeroDetail">Pro vytvoření predikce je potřeba několik hodin dat.</div>
+        <div class="hero-meta">
+          <span class="pill" id="forecastHeroConfidence">—</span>
+          <span class="pill neutral" id="forecastHeroUpdated">Aktualizace —</span>
+        </div>
+      </div>
+      <div class="hero-right">
+        <div class="forecast-stat">
+          <span>Teplota</span>
+          <strong id="forecastHeroTemp">—</strong>
+          <small>+1 h / +3 h</small>
+        </div>
+        <div class="forecast-stat">
+          <span>Vlhkost</span>
+          <strong id="forecastHeroHumidity">—</strong>
+          <small>+1 h / +3 h</small>
+        </div>
+        <div class="forecast-stat">
+          <span>Tlak</span>
+          <strong id="forecastHeroPressure">—</strong>
+          <small>+1 h / +3 h</small>
+        </div>
+        <div class="forecast-stat">
+          <span>Osvit</span>
+          <strong id="forecastHeroLux">—</strong>
+          <small>+1 h / +3 h</small>
+        </div>
+      </div>
+    </div>
     <div class="hero-grid">
       <article class="mini-card">
         <span class="mini-label">Teplota</span>
@@ -341,12 +385,16 @@
   <section id="tab-tools" style="display:none">
     <div class="grid">
       <div class="card">
-        <div class="section-title">Sken sběrnice I²C</div>
-        <button id="scanBtn" class="btn ghost">Spustit scan</button>
+        <div class="section-title">Sken a obnova sběrnice I²C</div>
+        <div class="btn-row">
+          <button id="scanBtn" class="btn ghost">Spustit scan</button>
+          <button id="i2cReinitBtn" class="btn ghost">Reinit sběrnice</button>
+        </div>
         <table style="margin-top:12px">
           <thead><tr><th>Adresa</th><th>Hex</th></tr></thead>
           <tbody id="i2cTable"><tr><td colspan="2" class="muted">Zatím nic…</td></tr></tbody>
         </table>
+        <div class="callout" id="i2cReinitHint">—</div>
       </div>
       <div class="card">
         <div class="section-title">Self-test senzorů</div>
@@ -357,6 +405,21 @@
         <div class="section-title">AutoQNH</div>
         <button id="aqRunBtn" class="btn ghost">Spustit AutoQNH nyní</button>
         <div class="callout" id="aqRunHint">—</div>
+      </div>
+      <div class="card">
+        <div class="section-title">Kalibrace pro predikci počasí</div>
+        <div class="kv">
+          <div>Stav souboru</div><div id="calibStatus">—</div>
+          <div>Záznamy</div><div id="calibEntries">—</div>
+          <div>Velikost</div><div id="calibSize">—</div>
+          <div>Interval dat</div><div id="calibRange">—</div>
+          <div>Pokr. (h)</div><div id="calibCoverage">—</div>
+        </div>
+        <div class="btn-row">
+          <button id="calibRefreshBtn" class="btn ghost">Přegenerovat predikci</button>
+          <button id="calibClearBtn" class="btn ghost">Vymazat historii</button>
+        </div>
+        <div class="callout" id="calibHint">—</div>
       </div>
     </div>
   </section>
@@ -606,6 +669,17 @@ async function refresh(){
     $('#pressureTrend').textContent=fmt.trend(st.pressure_trend_hpa_h);
 
     const fcValid=!!st.forecast_valid;
+    const fcDetail=st.forecast_detail||'Predikce zatím není k dispozici.';
+    const hero=$('#forecastHero'); if(hero) hero.classList.toggle('disabled',!fcValid);
+    $('#forecastHeroSummary').textContent=fcValid?(st.forecast_summary||'—'):'Predikce se připravuje';
+    $('#forecastHeroDetail').textContent=fcDetail;
+    $('#forecastHeroTemp').textContent=fcValid?`+1 h ${fmt.deg(st.forecast_temp_1h)} / +3 h ${fmt.deg(st.forecast_temp_3h)}`:'—';
+    $('#forecastHeroHumidity').textContent=fcValid?`+1 h ${fmt.percFloat(st.forecast_humidity_1h)} / +3 h ${fmt.percFloat(st.forecast_humidity_3h)}`:'—';
+    $('#forecastHeroPressure').textContent=fcValid?`+1 h ${fmt.hpaFloat(st.forecast_pressure_1h)} / +3 h ${fmt.hpaFloat(st.forecast_pressure_3h)}`:'—';
+    $('#forecastHeroLux').textContent=fcValid?`+1 h ${fmt.luxFloat(st.forecast_lux_1h)} / +3 h ${fmt.luxFloat(st.forecast_lux_3h)}`:'—';
+    const heroConf=$('#forecastHeroConfidence');
+    if(heroConf){ heroConf.textContent=fcValid?(st.forecast_confidence||'—'):'Nízká spolehlivost'; heroConf.className='pill '+(fcValid?'ok':'warn'); }
+    const heroUpd=$('#forecastHeroUpdated'); if(heroUpd) heroUpd.textContent=`Aktualizace ${fmt.dateTime(st.forecast_generated_ts)}`;
     $('#forecastSummary').textContent=fcValid?(st.forecast_summary||'—'):'Predikce nedostupná';
     $('#forecastConfidence').textContent=fcValid?(st.forecast_confidence||'—'):'—';
     $('#forecastTemp').textContent=fcValid?`+1 h ${fmt.deg(st.forecast_temp_1h)} • +3 h ${fmt.deg(st.forecast_temp_3h)}`:'—';
@@ -613,7 +687,7 @@ async function refresh(){
     $('#forecastPressure').textContent=fcValid?`+1 h ${fmt.hpaFloat(st.forecast_pressure_1h)} • +3 h ${fmt.hpaFloat(st.forecast_pressure_3h)}`:'—';
     $('#forecastLux').textContent=fcValid?`+1 h ${fmt.luxFloat(st.forecast_lux_1h)} • +3 h ${fmt.luxFloat(st.forecast_lux_3h)}`:'—';
     $('#forecastUpdated').textContent=fmt.dateTime(st.forecast_generated_ts);
-    $('#forecastHint').textContent=st.forecast_detail||'Predikce zatím není k dispozici.';
+    $('#forecastHint').textContent=fcDetail;
 
     const aqAge = st.aq_last_up_s ? (st.uptime_s||0) - st.aq_last_up_s : null;
     const aqAgeText = fmt.relative(aqAge);
@@ -730,6 +804,58 @@ async function doAqRun(){
   $('#aqRunHint').textContent=`Výsledek=${fmt.aqResult(st.aq_last_result)} • QNH=${fmt.pa(st.qnh)}`;
 }
 
+async function doI2cReinit(){
+  const hint=$('#i2cReinitHint'); if(hint) hint.textContent='Obnovuji sběrnici…';
+  try{
+    const res=await action('i2c_reinit');
+    if(hint) hint.textContent=`HTU=${res.htu_ok?'OK':'NOK'} • BH1750=${res.bh_ok?'OK':'NOK'} • BMP=${res.bmp_ok?'OK':'NOK'}`;
+    await refresh();
+  }catch(e){
+    if(hint) hint.textContent='Chyba: '+(e.message||'HTTP');
+  }
+}
+
+async function loadCalibrationInfo(){
+  const statusEl=$('#calibStatus'); if(!statusEl) return;
+  try{
+    const info=await api('/api/calibration');
+    statusEl.textContent=info.exists?'Soubor existuje':'Soubor zatím neexistuje';
+    const entries=Number(info.entries)||0;
+    $('#calibEntries').textContent=entries.toString();
+    const sizeBytes=Number(info.size_bytes)||0;
+    if(sizeBytes>=1024){
+      $('#calibSize').textContent=`${(sizeBytes/1024).toFixed(1)} kB`;
+    }else{
+      $('#calibSize').textContent=`${sizeBytes} B`;
+    }
+    const firstTs=Number(info.first_ts)||0;
+    const lastTs=Number(info.last_ts)||0;
+    if(entries>0&&firstTs&&lastTs){
+      $('#calibRange').textContent=`${fmt.dateTime(firstTs)} – ${fmt.dateTime(lastTs)}`;
+    }else{
+      $('#calibRange').textContent='—';
+    }
+    const coverage=Number(info.coverage_h)||0;
+    $('#calibCoverage').textContent=coverage?`${coverage} h`:'—';
+    $('#calibHint').textContent=info.status||'—';
+  }catch(e){
+    statusEl.textContent='Chyba čtení';
+    const hint=$('#calibHint'); if(hint) hint.textContent='Chyba: '+(e.message||'HTTP');
+  }
+}
+
+async function calibrationCommand(cmd){
+  const hint=$('#calibHint'); if(hint) hint.textContent=cmd==='clear'?'Mažu historii…':'Přepočítávám predikci…';
+  try{
+    await api('/api/calibration',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cmd})});
+    await loadCalibrationInfo();
+    await refresh();
+    if(hint) hint.textContent=cmd==='clear'?'Historie byla odstraněna.':'Predikce byla aktualizována.';
+  }catch(e){
+    if(hint) hint.textContent='Chyba: '+(e.message||'HTTP');
+  }
+}
+
 async function mbRead(){
   const addr=+$('#mb_addr').value, n=+$('#mb_n').value;
   const r=await api(`/api/mb?addr=${addr}&n=${n}`);
@@ -760,8 +886,11 @@ async function boot(){
   $('#scanBtn').onclick=doScan;
   $('#stBtn').onclick=doSelfTest;
   $('#aqRunBtn').onclick=doAqRun;
+  $('#i2cReinitBtn').onclick=doI2cReinit;
   $('#saveBtn').onclick=()=>saveConfig(true);
   $('#applyBtn').onclick=()=>saveConfig(false);
+  $('#calibRefreshBtn').onclick=()=>calibrationCommand('refresh');
+  $('#calibClearBtn').onclick=()=>calibrationCommand('clear');
   $('#mbReadBtn').onclick=mbRead;
   $('#mbWriteBtn').onclick=mbWrite;
   $('#f_aq_en').addEventListener('change',()=>{updateAutoQnhInputs();refreshManualAirportUI();});
@@ -814,7 +943,9 @@ async function boot(){
   await loadAirports();
   await refresh();
   await loadConfig();
+  await loadCalibrationInfo();
   setInterval(refresh,4000);
+  setInterval(loadCalibrationInfo,60000);
 }
 boot();
 </script>

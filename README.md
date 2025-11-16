@@ -8,6 +8,7 @@ Projekt obsahuje firmware pro meteostanici postavenou na ESP8266 nebo ESP32-C3. 
 - **Modbus TCP server** (port 502) s mirrorováním hlavních hodnot a možností online úprav konfigurace.
 - **Integrovaný webový server** s jednostránkovou aplikací (SPA) pro živý přehled hodnot, konfiguraci a diagnostiku.
 - **Automatická kalibrace QNH (AutoQNH)** využívající online zdroje METAR (NOAA TGFTP) s možností manuálního nastavení ICAO.
+- **Lokální predikce počasí** s adaptivní kalibrací, novým hero blokem v UI a správou historie přímo z webu.
 - **Sériová CLI konzole** pro rychlé ladění a změnu parametrů, včetně spouštění autotestu, skenu I2C a ručního rebootu.
 
 ## Přehled adresářů
@@ -48,7 +49,7 @@ Projekt obsahuje firmware pro meteostanici postavenou na ESP8266 nebo ESP32-C3. 
 - Web UI je dostupné na `/ui` a zobrazuje se automaticky při otevření kořenové URL.
 - Tab „Přehled“ zobrazuje aktuální hodnoty senzorů, odvozené veličiny a stav sítě.
 - Tab „Nastavení“ dovoluje měnit konfiguraci. Změny lze uložit do flash (`persist=true`) nebo pouze dočasně aplikovat.
-- Tab „Nástroje“ nabízí diagnostické akce (I2C scan, self-test, ruční spuštění AutoQNH, reboot).
+- Tab „Nástroje“ nabízí diagnostické akce (I2C scan, rozšířený reinit sběrnice, self-test, ruční spuštění AutoQNH, reboot) a správu kalibrační historie predikce.
 
 > HTML/JS front-end je uložený v LittleFS (`data/ui/index.html`), takže jej můžete upravovat a nahrávat nezávisle na firmware.
 
@@ -58,6 +59,7 @@ Projekt obsahuje firmware pro meteostanici postavenou na ESP8266 nebo ESP32-C3. 
 | `/api/status` | GET | Živé hodnoty senzorů, stav Wi-Fi, AutoQNH a výsledky posledního I2C skenu. |
 | `/api/config` | GET/POST | Čtení a změna konfigurace. POST umožňuje volbu `persist` pro uložení do LittleFS. |
 | `/api/action` | POST | Příkazy `scan`, `selftest`, `aq_run`, `reboot`. |
+| `/api/calibration` | GET/POST | Stav kalibračního souboru, příkazy `refresh` a `clear` pro predikce počasí. |
 | `/api/mb` | GET/POST | Přímé čtení a zápis Modbus holding registrů. |
 
 ## Modbus holding registry (výběr)

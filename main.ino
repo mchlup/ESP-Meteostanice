@@ -155,6 +155,7 @@ bool g_portalActive = false;
 
 // ----------------------------- Modbus -----------------------------------------
 ModbusIP mb;
+static bool g_modbusReady = false;
 
 // ----------------------------- FW verze ---------------------------------------
 static const uint16_t FW_MAJOR = 2;
@@ -310,6 +311,10 @@ static void mqttPublishHaClear();
 static void mqttPublishLoxoneClear();
 static void calibrationMaybeStoreSample();
 static void updateWeatherForecastFromHistory();
+struct CalibrationFileInfo;
+static void calibrationCollectInfo(CalibrationFileInfo &info);
+static bool calibrationDeleteHistory();
+static void calibrationRegenerateForecast();
 
 // ----------------------------- WiFiManager params -----------------------------
 WiFiManager wm;
@@ -346,6 +351,10 @@ Adafruit_BMP085 bmp;
 
 bool htu_ok = false, bh_ok = false, bmp_ok = false;
 
+static const uint8_t HTU_MAX_ERROR_COUNT = 3;
+static uint8_t      g_htuErrorCount = 0;
+static uint32_t     g_lastHtuRetryMs = 0;
+
 // Poslední hodnoty
 float   g_htu_t = NAN;   // °C
 float   g_htu_h = NAN;   // %
@@ -359,6 +368,14 @@ static time_t   g_lastCalibrationHour = 0;
 static uint32_t g_lastCalibrationCheckMs = 0;
 static uint32_t g_lastCalibrationStoreMs = 0;
 static uint32_t g_lastSensorSampleMs = 0;
+
+struct CalibrationFileInfo {
+  bool     exists     = false;
+  uint32_t entries    = 0;
+  uint32_t sizeBytes  = 0;
+  time_t   firstTs    = 0;
+  time_t   lastTs     = 0;
+};
 
 static bool   g_forecastValid = false;
 static float  g_forecastTemp1h = NAN;
@@ -1312,6 +1329,59 @@ static void calibrationMaybeStoreSample(){
   updateWeatherForecastFromHistory();
 }
 
+static void calibrationCollectInfo(CalibrationFileInfo &info){
+  info = CalibrationFileInfo();
+  info.exists = LittleFS.exists(CALIBRATION_PATH);
+  if (!info.exists) return;
+  File file = LittleFS.open(CALIBRATION_PATH, "r");
+  if (!file){ info.exists = false; return; }
+  info.sizeBytes = (uint32_t)file.size();
+  String line;
+  line.reserve(160);
+  while (file.available()){
+    line = file.readStringUntil('\n');
+    line.trim();
+    if (!line.length()) continue;
+    CalibrationSample sample;
+    if (parseCalibrationLine(line, sample)){
+      info.entries++;
+      if (info.firstTs == 0 || sample.ts < info.firstTs) info.firstTs = sample.ts;
+      if (sample.ts > info.lastTs) info.lastTs = sample.ts;
+    }
+  }
+  file.close();
+}
+
+static bool calibrationDeleteHistory(){
+  if (!LittleFS.exists(CALIBRATION_PATH)){
+    resetForecastOutputs();
+    g_forecastValid = false;
+    g_forecastSummary = "Predikce nedostupná";
+    g_forecastDetail = "Kalibrační soubor zatím neexistuje.";
+    g_forecastConfidence = "Neznámá";
+    g_forecastGeneratedTs = 0;
+    g_lastCalibrationHour = 0;
+    g_lastCalibrationStoreMs = 0;
+    return true;
+  }
+  bool removed = LittleFS.remove(CALIBRATION_PATH);
+  if (removed){
+    resetForecastOutputs();
+    g_forecastValid = false;
+    g_forecastSummary = "Predikce nedostupná";
+    g_forecastDetail = "Kalibrační historie byla odstraněna.";
+    g_forecastConfidence = "Neznámá";
+    g_forecastGeneratedTs = 0;
+    g_lastCalibrationHour = 0;
+    g_lastCalibrationStoreMs = 0;
+  }
+  return removed;
+}
+
+static void calibrationRegenerateForecast(){
+  updateWeatherForecastFromHistory();
+}
+
 // Hypsometrie: ALT z QNH (m)
 static inline float altitude_from_QNH_m(uint32_t p_Pa, float T_C, float RH, uint32_t qnh_Pa){
   if (!p_Pa || !qnh_Pa) return 0.0f;
@@ -1376,10 +1446,14 @@ void reinitI2C(){
   Wire.setClock(100000);
 
   // re-init senzorů na sběrnici
-  bh_ok  = bh1750.begin(BH1750::CONTINUOUS_HIGH_RES_MODE);
-  bmp_ok = bmp.begin();
+  htu_ok = initHTUSensor();
+  if (!htu_ok){ g_htu_t = NAN; g_htu_h = NAN; g_htuErrorCount = 0; }
+  bh_ok  = initBH1750Sensor();
+  bmp_ok = initBMP180Sensor();
 
-  DLOG("[I2C] Reinit done. BH:%s BMP:%s\r\n", bh_ok?"OK":"NOK", bmp_ok?"OK":"NOK");
+  mirrorSensorStatus();
+
+  DLOG("[I2C] Reinit done. HTU:%s BH:%s BMP:%s\r\n", htu_ok?"OK":"NOK", bh_ok?"OK":"NOK", bmp_ok?"OK":"NOK");
 }
 
 // ----------------------------- Senzory ----------------------------------------
@@ -1398,22 +1472,51 @@ static void sensorsPowerOff(){
   //digitalWrite(SENSOR_PWR_PIN, HIGH); // vypnout
 }
 
+static bool htuSoftReset(){
+  Wire.beginTransmission(0x40);
+  Wire.write(0xFE);
+  uint8_t err = Wire.endTransmission();
+  delay(15);
+  return err == 0;
+}
+
+static bool htuReadSample(float &t, float &h){
+  t = htu.readTemperature();
+  h = htu.readHumidity();
+  if (!isfinite(t) || !isfinite(h)) return false;
+  if (t <= -50.0f || t >= 150.0f) return false;
+  if (h < 0.0f || h > 100.0f) return false;
+  return true;
+}
+
+static bool initHTUSensor(){
+  g_lastHtuRetryMs = millis();
+  if (!htuSoftReset()) return false;
+  htu.begin();
+  float t = NAN, h = NAN;
+  if (!htuReadSample(t, h)) return false;
+  g_htu_t = t;
+  g_htu_h = h;
+  g_htuErrorCount = 0;
+  return true;
+}
+
+static bool initBH1750Sensor(){
+  return bh1750.begin(BH1750::CONTINUOUS_HIGH_RES_MODE);
+}
+
+static bool initBMP180Sensor(){
+  return bmp.begin();
+}
+
 void setupSensors(){
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);  // SDA=GPIO4(D2), SCL=GPIO5(D1) na ESP-Witty
   Wire.setClock(100000);
   delay(30);
 
-  Wire.beginTransmission(0x40);
-Wire.write(0xFE); // soft reset
-Wire.endTransmission();
-delay(15);
-
-  htu.begin();                  // SparkFun HTU21D: begin() je void
-  { float t=htu.readTemperature(), h=htu.readHumidity();
-    htu_ok = (t>-50 && t<150 && h>=0 && h<=100);
-  }
-  bh_ok  = bh1750.begin(BH1750::CONTINUOUS_HIGH_RES_MODE);
-  bmp_ok = bmp.begin();
+  htu_ok = initHTUSensor();
+  bh_ok  = initBH1750Sensor();
+  bmp_ok = initBMP180Sensor();
 
   DLOG("[INIT] HTU21D:%s, BH1750:%s, BMP180:%s\r\n", htu_ok?"OK":"NOK", bh_ok?"OK":"NOK", bmp_ok?"OK":"NOK");
 }
@@ -1447,10 +1550,14 @@ void setupModbus(){
   // Modbus echo-test init
   mb.Hreg(72, FW_MAJOR);
   mb.Hreg(73, FW_MINOR);
+
+  g_modbusReady = true;
+  mirrorSensorStatus();
 }
 
 // ----------------------------- Stav senzorů/utility ---------------------------
 uint16_t computeStatus(){ uint16_t st=0; if(htu_ok) st|=(1<<0); if(bh_ok) st|=(1<<1); if(bmp_ok) st|=(1<<2); return st; }
+static inline void mirrorSensorStatus(){ if (g_modbusReady) mb.Hreg(0, computeStatus()); }
 
 // ----------------------------- I2C scan ---------------------------------------
 void i2cScan(){
@@ -1489,6 +1596,7 @@ void sensorSelfTest(){
 
   mb.Hreg(112,htuStat); mb.Hreg(113,bhStat); mb.Hreg(114,bmpStat);
   htu_ok=(htuStat==0); bh_ok=(bhStat==0); bmp_ok=(bmpStat==0);
+  if (!htu_ok) g_lastHtuRetryMs = millis(); else g_htuErrorCount = 0;
   mb.Hreg(0,computeStatus()); mb.Hreg(102,0);
   DLOG("[TEST] HTU:%u BH:%u BMP:%u\r\n", htuStat,bhStat,bmpStat);
   g_selfTestActive=false;
@@ -1501,9 +1609,27 @@ void sensorSelfTest(){
 void pollAndPublishSensors(){
   // HTU21D
   if(htu_ok){
-    float t=htu.readTemperature(), h=htu.readHumidity();
-    if(t>-50 && t<150){ g_htu_t=t; mb.Hreg(10,(int16_t)lroundf(t*100.0f)); }
-    if(h>=0 && h<=100){ g_htu_h=h; mb.Hreg(11,(uint16_t)lroundf(h*100.0f)); }
+    float t=0.0f, h=0.0f;
+    if(htuReadSample(t,h)){
+      g_htu_t=t; g_htu_h=h;
+      mb.Hreg(10,(int16_t)lroundf(t*100.0f));
+      mb.Hreg(11,(uint16_t)lroundf(h*100.0f));
+      g_htuErrorCount=0;
+    } else {
+      if (g_htuErrorCount < 255) g_htuErrorCount++;
+      if (g_htuErrorCount >= HTU_MAX_ERROR_COUNT){
+        bool ok = initHTUSensor();
+        htu_ok = ok;
+        if (!ok){ g_htu_t = NAN; g_htu_h = NAN; mirrorSensorStatus(); }
+      }
+    }
+  } else {
+    uint32_t nowRetry = millis();
+    if (nowRetry - g_lastHtuRetryMs > 15000UL){
+      bool ok = initHTUSensor();
+      htu_ok = ok;
+      if (ok){ mirrorSensorStatus(); }
+    }
   }
   // BMP180
   if(bmp_ok){

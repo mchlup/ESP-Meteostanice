@@ -271,6 +271,16 @@ static void apiActionPost(){
     autoQNH_RunOnce();
     StaticJsonDocument<64> resp; resp["ok"] = true; sendJSONDoc(resp); return;
   }
+  if (!strcmp(cmd,"i2c_reinit")) {
+    reinitI2C();
+    StaticJsonDocument<128> resp;
+    resp["ok"] = true;
+    resp["htu_ok"] = htu_ok;
+    resp["bh_ok"] = bh_ok;
+    resp["bmp_ok"] = bmp_ok;
+    sendJSONDoc(resp);
+    return;
+  }
   if (!strcmp(cmd,"reboot")) {
     StaticJsonDocument<64> resp;
     resp["ok"] = true;
@@ -317,6 +327,60 @@ static void apiAirports(){
   sendJSONDoc(doc);
 }
 
+static void apiCalibrationGet(){
+  CalibrationFileInfo info;
+  calibrationCollectInfo(info);
+  StaticJsonDocument<320> doc;
+  doc["exists"] = info.exists;
+  doc["entries"] = info.entries;
+  doc["size_bytes"] = info.sizeBytes;
+  doc["first_ts"] = (info.firstTs > 0) ? (uint32_t)info.firstTs : 0;
+  doc["last_ts"] = (info.lastTs > 0) ? (uint32_t)info.lastTs : 0;
+  uint32_t coverage = 0;
+  if (info.entries > 1 && info.lastTs > info.firstTs){
+    coverage = (uint32_t)((info.lastTs - info.firstTs) / 3600UL);
+  }
+  doc["coverage_h"] = coverage;
+  if (!info.exists) doc["status"] = F("Soubor kalibrace zatím neexistuje.");
+  else if (!info.entries) doc["status"] = F("Soubor je prázdný – čekám na první vzorek.");
+  else doc["status"] = F("Historie je připravena pro predikce.");
+  doc["forecast_valid"] = g_forecastValid;
+  doc["forecast_summary"] = g_forecastSummary;
+  doc["forecast_confidence"] = g_forecastConfidence;
+  sendJSONDoc(doc);
+}
+
+static void apiCalibrationPost(){
+  StaticJsonDocument<160> d; if(!readJsonBody(d)) return sendErr(400,"bad json");
+  const char* cmd = d["cmd"] | "";
+  if (!strcmp(cmd,"clear")){
+    bool ok = calibrationDeleteHistory();
+    StaticJsonDocument<160> resp;
+    resp["ok"] = ok;
+    resp["forecast_valid"] = g_forecastValid;
+    resp["message"] = ok ? F("Kalibrační historie byla odstraněna.") : F("Soubor se nepodařilo odstranit.");
+    sendJSONDoc(resp);
+    return;
+  }
+  if (!strcmp(cmd,"refresh")){
+    calibrationRegenerateForecast();
+    CalibrationFileInfo info;
+    calibrationCollectInfo(info);
+    uint32_t coverage = 0;
+    if (info.entries > 1 && info.lastTs > info.firstTs){
+      coverage = (uint32_t)((info.lastTs - info.firstTs) / 3600UL);
+    }
+    StaticJsonDocument<192> resp;
+    resp["ok"] = true;
+    resp["forecast_valid"] = g_forecastValid;
+    resp["entries"] = info.entries;
+    resp["coverage_h"] = coverage;
+    sendJSONDoc(resp);
+    return;
+  }
+  sendErr(400,"unknown cmd");
+}
+
 // ---------- Mount routes + SPA ------------------------------------------------
 void httpInstallUI(){
   // SPA
@@ -334,6 +398,8 @@ void httpInstallUI(){
   server.on("/api/mb", HTTP_GET, apiMBGet);
   server.on("/api/mb", HTTP_POST, apiMBPost);
   server.on("/api/airports", HTTP_GET, apiAirports);
+  server.on("/api/calibration", HTTP_GET, apiCalibrationGet);
+  server.on("/api/calibration", HTTP_POST, apiCalibrationPost);
 
   server.onNotFound([](){
     if (httpTryServeStatic(server.uri())) return;

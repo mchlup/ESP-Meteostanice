@@ -327,6 +327,56 @@ static void apiAirports(){
   sendJSONDoc(doc);
 }
 
+static bool calibrationSampleFromJson(const JsonVariantConst& obj, CalibrationSample& sample, String& err){
+  if (!obj.is<JsonObject>()){
+    err = F("Chybí data záznamu.");
+    return false;
+  }
+  const char* ts = obj["timestamp"] | "";
+  if (!ts || !parseCalibrationTimestamp(String(ts), sample.ts)){
+    err = F("Neplatný čas záznamu.");
+    return false;
+  }
+  if (!obj.containsKey("temperature_c")){
+    err = F("Chybí teplota.");
+    return false;
+  }
+  if (!obj.containsKey("humidity_pct")){
+    err = F("Chybí vlhkost.");
+    return false;
+  }
+  if (!obj.containsKey("pressure_pa")){
+    err = F("Chybí tlak.");
+    return false;
+  }
+  float temp = obj["temperature_c"].as<float>();
+  float hum  = obj["humidity_pct"].as<float>();
+  float pressurePa = obj["pressure_pa"].as<float>();
+  if (isfinite(pressurePa) && pressurePa > 120.0f && pressurePa < 2000.0f){
+    // Pravděpodobně hodnota v hPa – převeď na Pa.
+    pressurePa *= 100.0f;
+  }
+  float lux = obj["lux"].isNull() ? 0.0f : obj["lux"].as<float>();
+  if (!isfinite(temp) || temp < -80.0f || temp > 120.0f){
+    err = F("Teplota mimo rozsah.");
+    return false;
+  }
+  if (!isfinite(hum) || hum < 0.0f || hum > 100.0f){
+    err = F("Vlhkost mimo rozsah.");
+    return false;
+  }
+  if (!isfinite(pressurePa) || pressurePa < 15000.0f || pressurePa > 120000.0f){
+    err = F("Tlak mimo rozsah (Pa / hPa).");
+    return false;
+  }
+  if (!isfinite(lux) || lux < 0.0f) lux = 0.0f;
+  sample.tempC = temp;
+  sample.humidity = hum;
+  sample.pressure_hpa = pressurePa / 100.0f;
+  sample.lux = lux;
+  return true;
+}
+
 static void apiCalibrationGet(){
   CalibrationFileInfo info;
   calibrationCollectInfo(info);
@@ -350,8 +400,33 @@ static void apiCalibrationGet(){
   sendJSONDoc(doc);
 }
 
+static void apiCalibrationHistory(){
+  int limit = server.hasArg("limit") ? server.arg("limit").toInt() : 48;
+  if (limit < 1) limit = 1;
+  if (limit > 168) limit = 168;
+  std::vector<CalibrationSample> samples;
+  if (!calibrationLoadSamples(samples)) return sendErr(500, F("Nelze načíst soubor."));
+  calibrationSortSamples(samples);
+  DynamicJsonDocument doc(8192);
+  JsonArray arr = doc.createNestedArray("entries");
+  int count = 0;
+  for (int i = (int)samples.size() - 1; i >= 0 && count < limit; --i, ++count){
+    const CalibrationSample& s = samples[i];
+    JsonObject obj = arr.createNestedObject();
+    obj["ts"] = (uint32_t)s.ts;
+    obj["timestamp"] = formatCalibrationTimestamp(s.ts);
+    obj["temperature_c"] = s.tempC;
+    obj["humidity_pct"] = s.humidity;
+    obj["pressure_pa"] = (uint32_t)lroundf(s.pressure_hpa * 100.0f);
+    obj["lux"] = s.lux;
+  }
+  doc["limit"] = limit;
+  doc["total"] = (uint32_t)samples.size();
+  sendJSONDoc(doc);
+}
+
 static void apiCalibrationPost(){
-  StaticJsonDocument<160> d; if(!readJsonBody(d)) return sendErr(400,"bad json");
+  StaticJsonDocument<320> d; if(!readJsonBody(d)) return sendErr(400,"bad json");
   const char* cmd = d["cmd"] | "";
   if (!strcmp(cmd,"clear")){
     bool ok = calibrationDeleteHistory();
@@ -378,6 +453,58 @@ static void apiCalibrationPost(){
     sendJSONDoc(resp);
     return;
   }
+  if (!strcmp(cmd,"create_file")){
+    bool force = d["force"] | false;
+    bool exists = LittleFS.exists(CALIBRATION_PATH);
+    if (exists && !force) return sendErr(409, F("Soubor již existuje."));
+    if (!calibrationCreateHistoryFile()) return sendErr(500, F("Soubor se nepodařilo vytvořit."));
+    CalibrationFileInfo info;
+    calibrationCollectInfo(info);
+    StaticJsonDocument<160> resp;
+    resp["ok"] = true;
+    resp["exists"] = info.exists;
+    resp["entries"] = info.entries;
+    sendJSONDoc(resp);
+    return;
+  }
+  if (!strcmp(cmd,"add") || !strcmp(cmd,"update")){
+    CalibrationSample sample;
+    String err;
+    if (!calibrationSampleFromJson(d["entry"], sample, err)) return sendErr(400, err);
+    CalibrationOpResult res;
+    if (!strcmp(cmd,"add")){
+      res = calibrationAddSample(sample);
+      if (res == CalibrationOpResult::DUPLICATE) return sendErr(409, F("Záznam pro tento čas již existuje."));
+      if (res == CalibrationOpResult::IO_ERROR) return sendErr(500, F("Nelze uložit záznam."));
+    } else {
+      time_t originalTs = sample.ts;
+      if (d.containsKey("original_ts")){
+        const char* o = d["original_ts"] | "";
+        time_t parsed;
+        if (!parseCalibrationTimestamp(String(o), parsed)) return sendErr(400, F("Neplatný původní čas."));
+        originalTs = parsed;
+      }
+      res = calibrationUpdateSample(sample, originalTs);
+      if (res == CalibrationOpResult::NOT_FOUND) return sendErr(404, F("Záznam s tímto časem nebyl nalezen."));
+      if (res == CalibrationOpResult::IO_ERROR) return sendErr(500, F("Nelze uložit záznam."));
+    }
+    StaticJsonDocument<128> resp;
+    resp["ok"] = true;
+    sendJSONDoc(resp);
+    return;
+  }
+  if (!strcmp(cmd,"delete")){
+    const char* ts = d["timestamp"] | "";
+    time_t t;
+    if (!parseCalibrationTimestamp(String(ts), t)) return sendErr(400, F("Neplatný čas pro smazání."));
+    CalibrationOpResult res = calibrationDeleteSample(t);
+    if (res == CalibrationOpResult::NOT_FOUND) return sendErr(404, F("Záznam nenalezen."));
+    if (res == CalibrationOpResult::IO_ERROR) return sendErr(500, F("Nelze uložit změny."));
+    StaticJsonDocument<96> resp;
+    resp["ok"] = true;
+    sendJSONDoc(resp);
+    return;
+  }
   sendErr(400,"unknown cmd");
 }
 
@@ -400,6 +527,7 @@ void httpInstallUI(){
   server.on("/api/airports", HTTP_GET, apiAirports);
   server.on("/api/calibration", HTTP_GET, apiCalibrationGet);
   server.on("/api/calibration", HTTP_POST, apiCalibrationPost);
+  server.on("/api/calibration/history", HTTP_GET, apiCalibrationHistory);
 
   server.onNotFound([](){
     if (httpTryServeStatic(server.uri())) return;

@@ -70,9 +70,21 @@
 #include <stdlib.h>
 #include <ctype.h>
 #include <vector>
+#include <algorithm>
 
 // Předdeklarace pro generované prototypy Arduino preprocesoru
 struct CalibrationSample;
+static float getAmbientTemperatureC();
+static bool parseCalibrationTimestamp(const String& iso, time_t& outTs);
+static String formatCalibrationTimestamp(time_t ts);
+static bool calibrationLoadSamples(std::vector<CalibrationSample>& samples);
+static bool calibrationSaveSamples(const std::vector<CalibrationSample>& samples);
+static void calibrationSortSamples(std::vector<CalibrationSample>& samples);
+enum class CalibrationOpResult : uint8_t { OK, DUPLICATE, NOT_FOUND, IO_ERROR };
+static CalibrationOpResult calibrationAddSample(const CalibrationSample& sample);
+static CalibrationOpResult calibrationUpdateSample(const CalibrationSample& sample, time_t originalTs);
+static CalibrationOpResult calibrationDeleteSample(time_t ts);
+static bool calibrationCreateHistoryFile();
 
 // ----------------------------- DEBUG ------------------------------------------
 #define DEBUG 0
@@ -361,6 +373,12 @@ float   g_htu_h = NAN;   // %
 float   g_bmp_t = NAN;   // °C
 uint32_t g_bmp_p = 0;    // Pa
 float   g_bh_lux = NAN;  // lx
+
+static float getAmbientTemperatureC(){
+  if (isfinite(g_htu_t)) return g_htu_t;
+  if (isfinite(g_bmp_t)) return g_bmp_t;
+  return NAN;
+}
 
 // ----------------------------- Kalibrace & predikce ---------------------------
 static const char* const CALIBRATION_PATH = "/calibration.csv";
@@ -996,7 +1014,8 @@ static inline float virtTemp_K_from_TRH_P(float T_C, float RH, uint32_t p_Pa){
 }
 
 static void updateBioForecast(){
-  if (isnan(g_htu_t) || isnan(g_htu_h) || g_bmp_p == 0){
+  float temp = getAmbientTemperatureC();
+  if (isnan(temp) || isnan(g_htu_h) || g_bmp_p == 0){
     g_bioIndex = -1;
     g_bioScore = 0.0f;
     g_bioLabel = "Bez dat";
@@ -1004,7 +1023,6 @@ static void updateBioForecast(){
     return;
   }
 
-  float temp = g_htu_t;
   float rh = clampf(g_htu_h, 0.0f, 100.0f);
   float pressure_hpa = g_bmp_p / 100.0f;
   float score = 0.0f;
@@ -1145,6 +1163,131 @@ static bool parseCalibrationLine(const String& line, CalibrationSample& out){
   return true;
 }
 
+static bool parseCalibrationTimestamp(const String& iso, time_t& outTs){
+  String trimmed = iso;
+  trimmed.trim();
+  if (!trimmed.length()) return false;
+  int year, month, day, hour, minute, second;
+  int matched = sscanf(trimmed.c_str(), "%d-%d-%dT%d:%d:%d",
+                       &year, &month, &day, &hour, &minute, &second);
+  if (matched != 6){
+    matched = sscanf(trimmed.c_str(), "%d-%d-%dT%d:%d",
+                     &year, &month, &day, &hour, &minute);
+    second = 0;
+  }
+  if (matched < 5) return false;
+  struct tm tmLocal;
+  memset(&tmLocal, 0, sizeof(tmLocal));
+  tmLocal.tm_year = year - 1900;
+  tmLocal.tm_mon  = month - 1;
+  tmLocal.tm_mday = day;
+  tmLocal.tm_hour = hour;
+  tmLocal.tm_min  = minute;
+  tmLocal.tm_sec  = second;
+  time_t ts = mktime(&tmLocal);
+  if (ts <= 0) return false;
+  outTs = ts;
+  return true;
+}
+
+static String formatCalibrationTimestamp(time_t ts){
+  if (ts <= 0) return String();
+  struct tm tmLocal;
+  if (!localtime_r(&ts, &tmLocal)) return String();
+  char buf[32];
+  size_t written = strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S", &tmLocal);
+  if (!written) return String();
+  return String(buf);
+}
+
+static bool calibrationLoadSamples(std::vector<CalibrationSample>& samples){
+  samples.clear();
+  if (!LittleFS.exists(CALIBRATION_PATH)) return true;
+  File file = LittleFS.open(CALIBRATION_PATH, "r");
+  if (!file) return false;
+  String line;
+  line.reserve(160);
+  while (file.available()){
+    line = file.readStringUntil('\n');
+    line.trim();
+    if (!line.length()) continue;
+    CalibrationSample sample;
+    if (parseCalibrationLine(line, sample)){
+      samples.push_back(sample);
+    }
+  }
+  file.close();
+  return true;
+}
+
+static bool calibrationSaveSamples(const std::vector<CalibrationSample>& samples){
+  if (samples.empty()){
+    if (LittleFS.exists(CALIBRATION_PATH)) LittleFS.remove(CALIBRATION_PATH);
+    updateWeatherForecastFromHistory();
+    return true;
+  }
+  File file = LittleFS.open(CALIBRATION_PATH, "w");
+  if (!file) return false;
+  file.println(F("timestamp;temperature_c;humidity_pct;pressure_pa;illuminance_lux"));
+  for (const auto& s : samples){
+    if (s.ts <= 0) continue;
+    String ts = formatCalibrationTimestamp(s.ts);
+    if (!ts.length()) continue;
+    char line[160];
+    snprintf(line, sizeof(line), "%s;%.2f;%.2f;%lu;%.2f",
+             ts.c_str(), s.tempC, s.humidity, (unsigned long)lroundf(s.pressure_hpa * 100.0f), s.lux);
+    file.println(line);
+  }
+  file.close();
+  updateWeatherForecastFromHistory();
+  return true;
+}
+
+static void calibrationSortSamples(std::vector<CalibrationSample>& samples){
+  std::sort(samples.begin(), samples.end(), [](const CalibrationSample& a, const CalibrationSample& b){
+    return a.ts < b.ts;
+  });
+}
+
+static CalibrationOpResult calibrationAddSample(const CalibrationSample& sample){
+  std::vector<CalibrationSample> samples;
+  if (!calibrationLoadSamples(samples)) return CalibrationOpResult::IO_ERROR;
+  for (const auto& s : samples){
+    if (s.ts == sample.ts) return CalibrationOpResult::DUPLICATE;
+  }
+  samples.push_back(sample);
+  calibrationSortSamples(samples);
+  return calibrationSaveSamples(samples) ? CalibrationOpResult::OK : CalibrationOpResult::IO_ERROR;
+}
+
+static CalibrationOpResult calibrationUpdateSample(const CalibrationSample& sample, time_t originalTs){
+  std::vector<CalibrationSample> samples;
+  if (!calibrationLoadSamples(samples)) return CalibrationOpResult::IO_ERROR;
+  if (originalTs <= 0) originalTs = sample.ts;
+  bool updated = false;
+  for (auto& s : samples){
+    if (s.ts == originalTs){
+      s = sample;
+      updated = true;
+      break;
+    }
+  }
+  if (!updated) return CalibrationOpResult::NOT_FOUND;
+  calibrationSortSamples(samples);
+  return calibrationSaveSamples(samples) ? CalibrationOpResult::OK : CalibrationOpResult::IO_ERROR;
+}
+
+static CalibrationOpResult calibrationDeleteSample(time_t ts){
+  if (ts <= 0) return CalibrationOpResult::NOT_FOUND;
+  std::vector<CalibrationSample> samples;
+  if (!calibrationLoadSamples(samples)) return CalibrationOpResult::IO_ERROR;
+  size_t before = samples.size();
+  samples.erase(std::remove_if(samples.begin(), samples.end(), [&](const CalibrationSample& s){ return s.ts == ts; }), samples.end());
+  if (samples.size() == before) return CalibrationOpResult::NOT_FOUND;
+  calibrationSortSamples(samples);
+  return calibrationSaveSamples(samples) ? CalibrationOpResult::OK : CalibrationOpResult::IO_ERROR;
+}
+
 static void updateWeatherForecastFromHistory(){
   resetForecastOutputs();
 
@@ -1197,20 +1340,26 @@ static void updateWeatherForecastFromHistory(){
   g_forecastGeneratedTs = samples.back().ts;
   g_lastCalibrationHour = g_forecastGeneratedTs - (g_forecastGeneratedTs % 3600);
 
-  const size_t MIN_SAMPLES = 6;
-  if (samples.size() < MIN_SAMPLES){
-    g_forecastValid = false;
-    g_forecastSummary = "Nedostatek dat";
-    g_forecastDetail = "Pro predikci je potřeba alespoň 6 hodinových záznamů.";
-    float coverage = (float)((samples.back().ts - samples.front().ts) / 3600.0);
-    if (coverage < 0) coverage = 0;
-    g_forecastConfidence = "Velmi nízká";
-    if (coverage > 0){
-      g_forecastConfidence += String(" (") + String(coverage, 0) + " h dat)";
-    }
+  size_t sampleCount = samples.size();
+  float coverageHours = (float)((samples.back().ts - samples.front().ts) / 3600.0);
+  if (coverageHours < 0) coverageHours = 0;
+
+  const CalibrationSample& last = samples.back();
+
+  if (sampleCount == 1){
+    g_forecastTemp1h = g_forecastTemp3h = clampf(last.tempC, -40.0f, 60.0f);
+    g_forecastHumidity1h = g_forecastHumidity3h = clampf(last.humidity, 0.0f, 100.0f);
+    g_forecastPressure1h = g_forecastPressure3h = clampf(last.pressure_hpa, 800.0f, 1100.0f);
+    g_forecastLux1h = g_forecastLux3h = clampf(last.lux, 0.0f, 200000.0f);
+    g_forecastSummary = F("První odhad podle posledního měření");
+    g_forecastDetail = String("Zatím jediný vzorek z ") + formatCalibrationTimestamp(last.ts) +
+                       ". Předpověď kopíruje aktuální hodnoty, dokud nepřibydou další data.";
+    g_forecastConfidence = F("Velmi nízká (1 vzorek)");
+    g_forecastValid = true;
     return;
   }
 
+  const size_t MIN_HISTORY_SAMPLES = 6;
   Regression regTemp, regHum, regPress, regLux;
   double baseTs = (double)samples.front().ts;
   double lastX = 0.0;
@@ -1223,7 +1372,6 @@ static void updateWeatherForecastFromHistory(){
     lastX = x;
   }
 
-  const CalibrationSample& last = samples.back();
   auto predictValue = [](const Regression& reg, double x, float fallback, float lo, float hi){
     float val = reg.predict(x, fallback);
     if (!isfinite(val)) val = fallback;
@@ -1252,6 +1400,9 @@ static void updateWeatherForecastFromHistory(){
   else if (tempSlope > 0.4f) summary = "Postupné oteplení";
   else if (tempSlope < -0.4f) summary = "Postupné ochlazení";
   else summary = "Stabilní podmínky";
+  if (sampleCount < MIN_HISTORY_SAMPLES){
+    summary = String("Krátký odhad: ") + summary;
+  }
 
   String detail = String("Za 1 h: T ") + String(g_forecastTemp1h, 1) + " °C, RH " +
                   String(g_forecastHumidity1h, 1) + " %, tlak " +
@@ -1266,14 +1417,19 @@ static void updateWeatherForecastFromHistory(){
             (tempSlope >= 0 ? "+" : "") + String(tempSlope, 2) + " °C/h, vlhkost " +
             (humSlope >= 0 ? "+" : "") + String(humSlope, 2) + " %/h.";
 
-  float coverageHours = (float)((samples.back().ts - samples.front().ts) / 3600.0);
-  if (coverageHours < 0) coverageHours = 0;
   if (coverageHours >= 72.0f) g_forecastConfidence = "Vysoká";
   else if (coverageHours >= 24.0f) g_forecastConfidence = "Střední";
-  else g_forecastConfidence = "Nižší";
-  g_forecastConfidence += String(" (") + String(coverageHours, 0) + " h dat)";
+  else if (coverageHours >= 6.0f) g_forecastConfidence = "Nižší";
+  else g_forecastConfidence = "Velmi nízká";
+  String coverageLabel;
+  if (coverageHours >= 1.0f) coverageLabel = String(coverageHours, 1) + " h dat";
+  else coverageLabel = F("<1 h dat");
+  g_forecastConfidence += String(" (") + coverageLabel + ")";
 
   g_forecastSummary = summary;
+  if (sampleCount < MIN_HISTORY_SAMPLES){
+    detail += F(" Historie zatím kratší než 6 hodin – predikce se bude zpřesňovat.");
+  }
   g_forecastDetail = detail;
   g_forecastValid = true;
 }
@@ -1376,6 +1532,22 @@ static bool calibrationDeleteHistory(){
     g_lastCalibrationStoreMs = 0;
   }
   return removed;
+}
+
+static bool calibrationCreateHistoryFile(){
+  File file = LittleFS.open(CALIBRATION_PATH, "w");
+  if (!file) return false;
+  file.println(F("timestamp;temperature_c;humidity_pct;pressure_pa;illuminance_lux"));
+  file.close();
+  resetForecastOutputs();
+  g_forecastValid = false;
+  g_forecastSummary = F("Predikce se připravuje…");
+  g_forecastDetail = F("Soubor byl vytvořen, čekám na první záznam.");
+  g_forecastConfidence = F("Neznámá");
+  g_forecastGeneratedTs = 0;
+  g_lastCalibrationHour = 0;
+  g_lastCalibrationStoreMs = 0;
+  return true;
 }
 
 static void calibrationRegenerateForecast(){
@@ -1674,26 +1846,28 @@ void pollAndPublishSensors(){
 
   uint32_t qnh_out = 0;
   int32_t  alt_cm  = 0;
+  float ambientTemp = getAmbientTemperatureC();
+  float ambientRh = g_htu_h;
 
   if (bmp_ok && g_bmp_p>0) {
     switch (mode) {
       case 1: // QNH only
-        if (qnh_cfg>0) { qnh_out=qnh_cfg; alt_cm=(int32_t)lroundf( altitude_from_QNH_m(g_bmp_p, g_htu_t, g_htu_h, qnh_out) * 100.0f ); }
+        if (qnh_cfg>0) { qnh_out=qnh_cfg; alt_cm=(int32_t)lroundf( altitude_from_QNH_m(g_bmp_p, ambientTemp, ambientRh, qnh_out) * 100.0f ); }
         break;
       case 2: // ISA only
         qnh_out = QNH_ISA;
-        alt_cm  = (int32_t)lroundf( altitude_from_QNH_m(g_bmp_p, g_htu_t, g_htu_h, qnh_out) * 100.0f );
+        alt_cm  = (int32_t)lroundf( altitude_from_QNH_m(g_bmp_p, ambientTemp, ambientRh, qnh_out) * 100.0f );
         break;
       case 3: // ELEV only → QNH z elevace, ALT=0
-        if (elev_m!=0) { qnh_out=qnh_from_elev_Pa(g_bmp_p, g_htu_t, g_htu_h, (float)elev_m); }
+        if (elev_m!=0) { qnh_out=qnh_from_elev_Pa(g_bmp_p, ambientTemp, ambientRh, (float)elev_m); }
         break;
       case 0: default: // AUTO
         if (qnh_cfg>0) {
-          qnh_out=qnh_cfg; alt_cm=(int32_t)lroundf( altitude_from_QNH_m(g_bmp_p, g_htu_t, g_htu_h, qnh_out) * 100.0f );
+          qnh_out=qnh_cfg; alt_cm=(int32_t)lroundf( altitude_from_QNH_m(g_bmp_p, ambientTemp, ambientRh, qnh_out) * 100.0f );
         } else if (elev_m!=0) {
-          qnh_out=qnh_from_elev_Pa(g_bmp_p, g_htu_t, g_htu_h, (float)elev_m);
+          qnh_out=qnh_from_elev_Pa(g_bmp_p, ambientTemp, ambientRh, (float)elev_m);
         } else {
-          qnh_out=QNH_ISA; alt_cm=(int32_t)lroundf( altitude_from_QNH_m(g_bmp_p, g_htu_t, g_htu_h, qnh_out) * 100.0f );
+          qnh_out=QNH_ISA; alt_cm=(int32_t)lroundf( altitude_from_QNH_m(g_bmp_p, ambientTemp, ambientRh, qnh_out) * 100.0f );
         }
         break;
     }

@@ -70,9 +70,20 @@
 #include <stdlib.h>
 #include <ctype.h>
 #include <vector>
+#include <algorithm>
 
 // Předdeklarace pro generované prototypy Arduino preprocesoru
 struct CalibrationSample;
+static float getAmbientTemperatureC();
+static bool parseCalibrationTimestamp(const String& iso, time_t& outTs);
+static String formatCalibrationTimestamp(time_t ts);
+static bool calibrationLoadSamples(std::vector<CalibrationSample>& samples);
+static bool calibrationSaveSamples(const std::vector<CalibrationSample>& samples);
+static void calibrationSortSamples(std::vector<CalibrationSample>& samples);
+enum class CalibrationOpResult : uint8_t { OK, DUPLICATE, NOT_FOUND, IO_ERROR };
+static CalibrationOpResult calibrationAddSample(const CalibrationSample& sample);
+static CalibrationOpResult calibrationUpdateSample(const CalibrationSample& sample, time_t originalTs);
+static CalibrationOpResult calibrationDeleteSample(time_t ts);
 
 // ----------------------------- DEBUG ------------------------------------------
 #define DEBUG 0
@@ -361,6 +372,12 @@ float   g_htu_h = NAN;   // %
 float   g_bmp_t = NAN;   // °C
 uint32_t g_bmp_p = 0;    // Pa
 float   g_bh_lux = NAN;  // lx
+
+static float getAmbientTemperatureC(){
+  if (isfinite(g_htu_t)) return g_htu_t;
+  if (isfinite(g_bmp_t)) return g_bmp_t;
+  return NAN;
+}
 
 // ----------------------------- Kalibrace & predikce ---------------------------
 static const char* const CALIBRATION_PATH = "/calibration.csv";
@@ -996,7 +1013,8 @@ static inline float virtTemp_K_from_TRH_P(float T_C, float RH, uint32_t p_Pa){
 }
 
 static void updateBioForecast(){
-  if (isnan(g_htu_t) || isnan(g_htu_h) || g_bmp_p == 0){
+  float temp = getAmbientTemperatureC();
+  if (isnan(temp) || isnan(g_htu_h) || g_bmp_p == 0){
     g_bioIndex = -1;
     g_bioScore = 0.0f;
     g_bioLabel = "Bez dat";
@@ -1004,7 +1022,6 @@ static void updateBioForecast(){
     return;
   }
 
-  float temp = g_htu_t;
   float rh = clampf(g_htu_h, 0.0f, 100.0f);
   float pressure_hpa = g_bmp_p / 100.0f;
   float score = 0.0f;
@@ -1143,6 +1160,131 @@ static bool parseCalibrationLine(const String& line, CalibrationSample& out){
   out.pressure_hpa = (float)pressurePa / 100.0f;
   out.lux = lux;
   return true;
+}
+
+static bool parseCalibrationTimestamp(const String& iso, time_t& outTs){
+  String trimmed = iso;
+  trimmed.trim();
+  if (!trimmed.length()) return false;
+  int year, month, day, hour, minute, second;
+  int matched = sscanf(trimmed.c_str(), "%d-%d-%dT%d:%d:%d",
+                       &year, &month, &day, &hour, &minute, &second);
+  if (matched != 6){
+    matched = sscanf(trimmed.c_str(), "%d-%d-%dT%d:%d",
+                     &year, &month, &day, &hour, &minute);
+    second = 0;
+  }
+  if (matched < 5) return false;
+  struct tm tmLocal;
+  memset(&tmLocal, 0, sizeof(tmLocal));
+  tmLocal.tm_year = year - 1900;
+  tmLocal.tm_mon  = month - 1;
+  tmLocal.tm_mday = day;
+  tmLocal.tm_hour = hour;
+  tmLocal.tm_min  = minute;
+  tmLocal.tm_sec  = second;
+  time_t ts = mktime(&tmLocal);
+  if (ts <= 0) return false;
+  outTs = ts;
+  return true;
+}
+
+static String formatCalibrationTimestamp(time_t ts){
+  if (ts <= 0) return String();
+  struct tm tmLocal;
+  if (!localtime_r(&ts, &tmLocal)) return String();
+  char buf[32];
+  size_t written = strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S", &tmLocal);
+  if (!written) return String();
+  return String(buf);
+}
+
+static bool calibrationLoadSamples(std::vector<CalibrationSample>& samples){
+  samples.clear();
+  if (!LittleFS.exists(CALIBRATION_PATH)) return true;
+  File file = LittleFS.open(CALIBRATION_PATH, "r");
+  if (!file) return false;
+  String line;
+  line.reserve(160);
+  while (file.available()){
+    line = file.readStringUntil('\n');
+    line.trim();
+    if (!line.length()) continue;
+    CalibrationSample sample;
+    if (parseCalibrationLine(line, sample)){
+      samples.push_back(sample);
+    }
+  }
+  file.close();
+  return true;
+}
+
+static bool calibrationSaveSamples(const std::vector<CalibrationSample>& samples){
+  if (samples.empty()){
+    if (LittleFS.exists(CALIBRATION_PATH)) LittleFS.remove(CALIBRATION_PATH);
+    updateWeatherForecastFromHistory();
+    return true;
+  }
+  File file = LittleFS.open(CALIBRATION_PATH, "w");
+  if (!file) return false;
+  file.println(F("timestamp;temperature_c;humidity_pct;pressure_pa;illuminance_lux"));
+  for (const auto& s : samples){
+    if (s.ts <= 0) continue;
+    String ts = formatCalibrationTimestamp(s.ts);
+    if (!ts.length()) continue;
+    char line[160];
+    snprintf(line, sizeof(line), "%s;%.2f;%.2f;%lu;%.2f",
+             ts.c_str(), s.tempC, s.humidity, (unsigned long)lroundf(s.pressure_hpa * 100.0f), s.lux);
+    file.println(line);
+  }
+  file.close();
+  updateWeatherForecastFromHistory();
+  return true;
+}
+
+static void calibrationSortSamples(std::vector<CalibrationSample>& samples){
+  std::sort(samples.begin(), samples.end(), [](const CalibrationSample& a, const CalibrationSample& b){
+    return a.ts < b.ts;
+  });
+}
+
+static CalibrationOpResult calibrationAddSample(const CalibrationSample& sample){
+  std::vector<CalibrationSample> samples;
+  if (!calibrationLoadSamples(samples)) return CalibrationOpResult::IO_ERROR;
+  for (const auto& s : samples){
+    if (s.ts == sample.ts) return CalibrationOpResult::DUPLICATE;
+  }
+  samples.push_back(sample);
+  calibrationSortSamples(samples);
+  return calibrationSaveSamples(samples) ? CalibrationOpResult::OK : CalibrationOpResult::IO_ERROR;
+}
+
+static CalibrationOpResult calibrationUpdateSample(const CalibrationSample& sample, time_t originalTs){
+  std::vector<CalibrationSample> samples;
+  if (!calibrationLoadSamples(samples)) return CalibrationOpResult::IO_ERROR;
+  if (originalTs <= 0) originalTs = sample.ts;
+  bool updated = false;
+  for (auto& s : samples){
+    if (s.ts == originalTs){
+      s = sample;
+      updated = true;
+      break;
+    }
+  }
+  if (!updated) return CalibrationOpResult::NOT_FOUND;
+  calibrationSortSamples(samples);
+  return calibrationSaveSamples(samples) ? CalibrationOpResult::OK : CalibrationOpResult::IO_ERROR;
+}
+
+static CalibrationOpResult calibrationDeleteSample(time_t ts){
+  if (ts <= 0) return CalibrationOpResult::NOT_FOUND;
+  std::vector<CalibrationSample> samples;
+  if (!calibrationLoadSamples(samples)) return CalibrationOpResult::IO_ERROR;
+  size_t before = samples.size();
+  samples.erase(std::remove_if(samples.begin(), samples.end(), [&](const CalibrationSample& s){ return s.ts == ts; }), samples.end());
+  if (samples.size() == before) return CalibrationOpResult::NOT_FOUND;
+  calibrationSortSamples(samples);
+  return calibrationSaveSamples(samples) ? CalibrationOpResult::OK : CalibrationOpResult::IO_ERROR;
 }
 
 static void updateWeatherForecastFromHistory(){
@@ -1674,26 +1816,28 @@ void pollAndPublishSensors(){
 
   uint32_t qnh_out = 0;
   int32_t  alt_cm  = 0;
+  float ambientTemp = getAmbientTemperatureC();
+  float ambientRh = g_htu_h;
 
   if (bmp_ok && g_bmp_p>0) {
     switch (mode) {
       case 1: // QNH only
-        if (qnh_cfg>0) { qnh_out=qnh_cfg; alt_cm=(int32_t)lroundf( altitude_from_QNH_m(g_bmp_p, g_htu_t, g_htu_h, qnh_out) * 100.0f ); }
+        if (qnh_cfg>0) { qnh_out=qnh_cfg; alt_cm=(int32_t)lroundf( altitude_from_QNH_m(g_bmp_p, ambientTemp, ambientRh, qnh_out) * 100.0f ); }
         break;
       case 2: // ISA only
         qnh_out = QNH_ISA;
-        alt_cm  = (int32_t)lroundf( altitude_from_QNH_m(g_bmp_p, g_htu_t, g_htu_h, qnh_out) * 100.0f );
+        alt_cm  = (int32_t)lroundf( altitude_from_QNH_m(g_bmp_p, ambientTemp, ambientRh, qnh_out) * 100.0f );
         break;
       case 3: // ELEV only → QNH z elevace, ALT=0
-        if (elev_m!=0) { qnh_out=qnh_from_elev_Pa(g_bmp_p, g_htu_t, g_htu_h, (float)elev_m); }
+        if (elev_m!=0) { qnh_out=qnh_from_elev_Pa(g_bmp_p, ambientTemp, ambientRh, (float)elev_m); }
         break;
       case 0: default: // AUTO
         if (qnh_cfg>0) {
-          qnh_out=qnh_cfg; alt_cm=(int32_t)lroundf( altitude_from_QNH_m(g_bmp_p, g_htu_t, g_htu_h, qnh_out) * 100.0f );
+          qnh_out=qnh_cfg; alt_cm=(int32_t)lroundf( altitude_from_QNH_m(g_bmp_p, ambientTemp, ambientRh, qnh_out) * 100.0f );
         } else if (elev_m!=0) {
-          qnh_out=qnh_from_elev_Pa(g_bmp_p, g_htu_t, g_htu_h, (float)elev_m);
+          qnh_out=qnh_from_elev_Pa(g_bmp_p, ambientTemp, ambientRh, (float)elev_m);
         } else {
-          qnh_out=QNH_ISA; alt_cm=(int32_t)lroundf( altitude_from_QNH_m(g_bmp_p, g_htu_t, g_htu_h, qnh_out) * 100.0f );
+          qnh_out=QNH_ISA; alt_cm=(int32_t)lroundf( altitude_from_QNH_m(g_bmp_p, ambientTemp, ambientRh, qnh_out) * 100.0f );
         }
         break;
     }

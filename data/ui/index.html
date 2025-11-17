@@ -421,6 +421,39 @@
         </div>
         <div class="callout" id="calibHint">—</div>
       </div>
+      <div class="card">
+        <div class="section-title">Správa kalibračních záznamů</div>
+        <div class="form-grid">
+          <label>Čas (lokální)
+            <input id="calibTs" type="datetime-local" step="60">
+          </label>
+          <label>Teplota [°C]
+            <input id="calibTemp" type="number" step="0.1" placeholder="20.5">
+          </label>
+          <label>Vlhkost [%]
+            <input id="calibHum" type="number" step="0.1" placeholder="50.0">
+          </label>
+          <label>Tlak [Pa]
+            <input id="calibPress" type="number" step="1" placeholder="101325">
+          </label>
+          <label>Osvit [lx]
+            <input id="calibLux" type="number" step="1" placeholder="0">
+          </label>
+        </div>
+        <input id="calibEditTs" type="hidden">
+        <div class="btn-row" style="margin-top:12px">
+          <button id="calibSaveBtn" class="btn">Uložit záznam</button>
+          <button id="calibResetBtn" class="btn ghost">Vymazat formulář</button>
+        </div>
+        <div class="callout" id="calibFormHint">—</div>
+        <div class="section-title">Poslední záznamy</div>
+        <table>
+          <thead>
+            <tr><th>Čas</th><th>Teplota</th><th>Vlhkost</th><th>Tlak</th><th>Osvit</th><th>Akce</th></tr>
+          </thead>
+          <tbody id="calibHistory"><tr><td colspan="6" class="muted">Zatím žádná data…</td></tr></tbody>
+        </table>
+      </div>
     </div>
   </section>
 
@@ -844,11 +877,109 @@ async function loadCalibrationInfo(){
   }
 }
 
+function normalizeCalibTimestampInput(val){
+  if(!val) return '';
+  let trimmed=val.trim();
+  if(trimmed.length===16) return trimmed+':00';
+  return trimmed;
+}
+
+function fillCalibForm(entry){
+  const tsInput=$('#calibTs'); if(tsInput) tsInput.value=(entry.timestamp||'').slice(0,16);
+  $('#calibTemp').value=entry.temperature_c!=null?entry.temperature_c:'';
+  $('#calibHum').value=entry.humidity_pct!=null?entry.humidity_pct:'';
+  $('#calibPress').value=entry.pressure_pa!=null?entry.pressure_pa:'';
+  $('#calibLux').value=entry.lux!=null?entry.lux:'';
+  $('#calibEditTs').value=entry.timestamp||'';
+  $('#calibFormHint').textContent='Režim úpravy záznamu.';
+}
+
+function resetCalibForm(){
+  $('#calibTs').value='';
+  $('#calibTemp').value='';
+  $('#calibHum').value='';
+  $('#calibPress').value='';
+  $('#calibLux').value='';
+  $('#calibEditTs').value='';
+  $('#calibFormHint').textContent='—';
+}
+
+async function loadCalibrationHistory(){
+  const tbody=$('#calibHistory'); if(!tbody) return;
+  try{
+    const r=await api('/api/calibration/history?limit=72');
+    const entries=r.entries||[];
+    if(!entries.length){
+      tbody.innerHTML='<tr><td colspan="6" class="muted">Žádné dostupné záznamy.</td></tr>';
+      return;
+    }
+    tbody.innerHTML=entries.map(e=>`
+      <tr>
+        <td>${fmt.dateTime(e.ts)}</td>
+        <td>${fmt.deg(e.temperature_c)}</td>
+        <td>${fmt.percFloat(e.humidity_pct)}</td>
+        <td>${fmt.pa(e.pressure_pa)}</td>
+        <td>${fmt.luxFloat(e.lux)}</td>
+        <td>
+          <div class="btn-row">
+            <button class="btn small ghost" data-action="edit" data-ts="${e.timestamp}" data-temp="${e.temperature_c}" data-hum="${e.humidity_pct}" data-press="${e.pressure_pa}" data-lux="${e.lux||0}">Upravit</button>
+            <button class="btn small ghost" data-action="delete" data-ts="${e.timestamp}">Smazat</button>
+          </div>
+        </td>
+      </tr>`).join('');
+  }catch(e){
+    tbody.innerHTML=`<tr><td colspan="6" class="err">Chyba načítání: ${e.message||'HTTP'}</td></tr>`;
+  }
+}
+
+async function saveCalibrationEntry(){
+  const hint=$('#calibFormHint'); if(hint) hint.textContent='Odesílám…';
+  const tsInput=normalizeCalibTimestampInput($('#calibTs').value);
+  const temp=parseFloat($('#calibTemp').value);
+  const hum=parseFloat($('#calibHum').value);
+  const press=parseInt($('#calibPress').value,10);
+  const luxValue=$('#calibLux').value.trim();
+  const lux=luxValue.length?parseFloat(luxValue):0;
+  if(!tsInput){ if(hint) hint.textContent='Vyplňte čas záznamu.'; return; }
+  if(!Number.isFinite(temp)){ if(hint) hint.textContent='Vyplňte teplotu.'; return; }
+  if(!Number.isFinite(hum)){ if(hint) hint.textContent='Vyplňte vlhkost.'; return; }
+  if(!Number.isFinite(press)){ if(hint) hint.textContent='Vyplňte tlak v Pa.'; return; }
+  const entry={timestamp:tsInput,temperature_c:+temp.toFixed(2),humidity_pct:+hum.toFixed(2),pressure_pa:press,lux:Number.isFinite(lux)?+lux.toFixed(1):0};
+  const originalTs=$('#calibEditTs').value;
+  const body={cmd:originalTs?'update':'add',entry};
+  if(originalTs && originalTs!==entry.timestamp) body.original_ts=originalTs;
+  try{
+    await api('/api/calibration',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    if(hint) hint.textContent=originalTs?'Záznam byl upraven.':'Záznam byl přidán.';
+    resetCalibForm();
+    await loadCalibrationInfo();
+    await loadCalibrationHistory();
+  }catch(e){
+    if(hint) hint.textContent='Chyba: '+(e.message||'HTTP');
+  }
+}
+
+async function deleteCalibrationEntry(ts){
+  if(!ts) return;
+  if(!confirm('Opravdu odstranit tento záznam?')) return;
+  const hint=$('#calibFormHint'); if(hint) hint.textContent='Mažu záznam…';
+  try{
+    await api('/api/calibration',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cmd:'delete',timestamp:ts})});
+    if($('#calibEditTs').value===ts) resetCalibForm();
+    if(hint) hint.textContent='Záznam byl odstraněn.';
+    await loadCalibrationInfo();
+    await loadCalibrationHistory();
+  }catch(e){
+    if(hint) hint.textContent='Chyba: '+(e.message||'HTTP');
+  }
+}
+
 async function calibrationCommand(cmd){
   const hint=$('#calibHint'); if(hint) hint.textContent=cmd==='clear'?'Mažu historii…':'Přepočítávám predikci…';
   try{
     await api('/api/calibration',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cmd})});
     await loadCalibrationInfo();
+    await loadCalibrationHistory();
     await refresh();
     if(hint) hint.textContent=cmd==='clear'?'Historie byla odstraněna.':'Predikce byla aktualizována.';
   }catch(e){
@@ -891,6 +1022,8 @@ async function boot(){
   $('#applyBtn').onclick=()=>saveConfig(false);
   $('#calibRefreshBtn').onclick=()=>calibrationCommand('refresh');
   $('#calibClearBtn').onclick=()=>calibrationCommand('clear');
+  $('#calibSaveBtn').onclick=saveCalibrationEntry;
+  $('#calibResetBtn').onclick=resetCalibForm;
   $('#mbReadBtn').onclick=mbRead;
   $('#mbWriteBtn').onclick=mbWrite;
   $('#f_aq_en').addEventListener('change',()=>{updateAutoQnhInputs();refreshManualAirportUI();});
@@ -938,14 +1071,36 @@ async function boot(){
       refreshManualAirportUI();
     });
   }
+  const calibHistory=$('#calibHistory');
+  if(calibHistory){
+    calibHistory.addEventListener('click',e=>{
+      const btn=e.target.closest?e.target.closest('button[data-action]'):null;
+      if(!btn)return;
+      const action=btn.getAttribute('data-action');
+      const ts=btn.getAttribute('data-ts');
+      if(action==='edit'){
+        fillCalibForm({
+          timestamp:ts,
+          temperature_c:btn.getAttribute('data-temp'),
+          humidity_pct:btn.getAttribute('data-hum'),
+          pressure_pa:btn.getAttribute('data-press'),
+          lux:btn.getAttribute('data-lux')
+        });
+      }else if(action==='delete'){
+        deleteCalibrationEntry(ts);
+      }
+    });
+  }
 
   updateAutoQnhInputs();
   await loadAirports();
   await refresh();
   await loadConfig();
   await loadCalibrationInfo();
+  await loadCalibrationHistory();
   setInterval(refresh,4000);
   setInterval(loadCalibrationInfo,60000);
+  setInterval(loadCalibrationHistory,60000);
 }
 boot();
 </script>

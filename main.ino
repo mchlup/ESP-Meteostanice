@@ -1340,20 +1340,26 @@ static void updateWeatherForecastFromHistory(){
   g_forecastGeneratedTs = samples.back().ts;
   g_lastCalibrationHour = g_forecastGeneratedTs - (g_forecastGeneratedTs % 3600);
 
-  const size_t MIN_SAMPLES = 6;
-  if (samples.size() < MIN_SAMPLES){
-    g_forecastValid = false;
-    g_forecastSummary = "Nedostatek dat";
-    g_forecastDetail = "Pro predikci je potřeba alespoň 6 hodinových záznamů.";
-    float coverage = (float)((samples.back().ts - samples.front().ts) / 3600.0);
-    if (coverage < 0) coverage = 0;
-    g_forecastConfidence = "Velmi nízká";
-    if (coverage > 0){
-      g_forecastConfidence += String(" (") + String(coverage, 0) + " h dat)";
-    }
+  size_t sampleCount = samples.size();
+  float coverageHours = (float)((samples.back().ts - samples.front().ts) / 3600.0);
+  if (coverageHours < 0) coverageHours = 0;
+
+  const CalibrationSample& last = samples.back();
+
+  if (sampleCount == 1){
+    g_forecastTemp1h = g_forecastTemp3h = clampf(last.tempC, -40.0f, 60.0f);
+    g_forecastHumidity1h = g_forecastHumidity3h = clampf(last.humidity, 0.0f, 100.0f);
+    g_forecastPressure1h = g_forecastPressure3h = clampf(last.pressure_hpa, 800.0f, 1100.0f);
+    g_forecastLux1h = g_forecastLux3h = clampf(last.lux, 0.0f, 200000.0f);
+    g_forecastSummary = F("První odhad podle posledního měření");
+    g_forecastDetail = String("Zatím jediný vzorek z ") + formatCalibrationTimestamp(last.ts) +
+                       ". Předpověď kopíruje aktuální hodnoty, dokud nepřibydou další data.";
+    g_forecastConfidence = F("Velmi nízká (1 vzorek)");
+    g_forecastValid = true;
     return;
   }
 
+  const size_t MIN_HISTORY_SAMPLES = 6;
   Regression regTemp, regHum, regPress, regLux;
   double baseTs = (double)samples.front().ts;
   double lastX = 0.0;
@@ -1366,7 +1372,6 @@ static void updateWeatherForecastFromHistory(){
     lastX = x;
   }
 
-  const CalibrationSample& last = samples.back();
   auto predictValue = [](const Regression& reg, double x, float fallback, float lo, float hi){
     float val = reg.predict(x, fallback);
     if (!isfinite(val)) val = fallback;
@@ -1395,6 +1400,9 @@ static void updateWeatherForecastFromHistory(){
   else if (tempSlope > 0.4f) summary = "Postupné oteplení";
   else if (tempSlope < -0.4f) summary = "Postupné ochlazení";
   else summary = "Stabilní podmínky";
+  if (sampleCount < MIN_HISTORY_SAMPLES){
+    summary = String("Krátký odhad: ") + summary;
+  }
 
   String detail = String("Za 1 h: T ") + String(g_forecastTemp1h, 1) + " °C, RH " +
                   String(g_forecastHumidity1h, 1) + " %, tlak " +
@@ -1409,14 +1417,19 @@ static void updateWeatherForecastFromHistory(){
             (tempSlope >= 0 ? "+" : "") + String(tempSlope, 2) + " °C/h, vlhkost " +
             (humSlope >= 0 ? "+" : "") + String(humSlope, 2) + " %/h.";
 
-  float coverageHours = (float)((samples.back().ts - samples.front().ts) / 3600.0);
-  if (coverageHours < 0) coverageHours = 0;
   if (coverageHours >= 72.0f) g_forecastConfidence = "Vysoká";
   else if (coverageHours >= 24.0f) g_forecastConfidence = "Střední";
-  else g_forecastConfidence = "Nižší";
-  g_forecastConfidence += String(" (") + String(coverageHours, 0) + " h dat)";
+  else if (coverageHours >= 6.0f) g_forecastConfidence = "Nižší";
+  else g_forecastConfidence = "Velmi nízká";
+  String coverageLabel;
+  if (coverageHours >= 1.0f) coverageLabel = String(coverageHours, 1) + " h dat";
+  else coverageLabel = F("<1 h dat");
+  g_forecastConfidence += String(" (") + coverageLabel + ")";
 
   g_forecastSummary = summary;
+  if (sampleCount < MIN_HISTORY_SAMPLES){
+    detail += F(" Historie zatím kratší než 6 hodin – predikce se bude zpřesňovat.");
+  }
   g_forecastDetail = detail;
   g_forecastValid = true;
 }

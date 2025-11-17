@@ -84,6 +84,7 @@ enum class CalibrationOpResult : uint8_t { OK, DUPLICATE, NOT_FOUND, IO_ERROR };
 static CalibrationOpResult calibrationAddSample(const CalibrationSample& sample);
 static CalibrationOpResult calibrationUpdateSample(const CalibrationSample& sample, time_t originalTs);
 static CalibrationOpResult calibrationDeleteSample(time_t ts);
+static bool calibrationCreateHistoryFile();
 
 // ----------------------------- DEBUG ------------------------------------------
 #define DEBUG 0
@@ -1518,6 +1519,22 @@ static bool calibrationDeleteHistory(){
     g_lastCalibrationStoreMs = 0;
   }
   return removed;
+}
+
+static bool calibrationCreateHistoryFile(){
+  File file = LittleFS.open(CALIBRATION_PATH, "w");
+  if (!file) return false;
+  file.println(F("timestamp;temperature_c;humidity_pct;pressure_pa;illuminance_lux"));
+  file.close();
+  resetForecastOutputs();
+  g_forecastValid = false;
+  g_forecastSummary = F("Predikce se připravuje…");
+  g_forecastDetail = F("Soubor byl vytvořen, čekám na první záznam.");
+  g_forecastConfidence = F("Neznámá");
+  g_forecastGeneratedTs = 0;
+  g_lastCalibrationHour = 0;
+  g_lastCalibrationStoreMs = 0;
+  return true;
 }
 
 static void calibrationRegenerateForecast(){

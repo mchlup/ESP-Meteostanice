@@ -352,6 +352,10 @@ static bool calibrationSampleFromJson(const JsonVariantConst& obj, CalibrationSa
   float temp = obj["temperature_c"].as<float>();
   float hum  = obj["humidity_pct"].as<float>();
   float pressurePa = obj["pressure_pa"].as<float>();
+  if (isfinite(pressurePa) && pressurePa > 120.0f && pressurePa < 2000.0f){
+    // Pravděpodobně hodnota v hPa – převeď na Pa.
+    pressurePa *= 100.0f;
+  }
   float lux = obj["lux"].isNull() ? 0.0f : obj["lux"].as<float>();
   if (!isfinite(temp) || temp < -80.0f || temp > 120.0f){
     err = F("Teplota mimo rozsah.");
@@ -362,7 +366,7 @@ static bool calibrationSampleFromJson(const JsonVariantConst& obj, CalibrationSa
     return false;
   }
   if (!isfinite(pressurePa) || pressurePa < 15000.0f || pressurePa > 120000.0f){
-    err = F("Tlak mimo rozsah (Pa).");
+    err = F("Tlak mimo rozsah (Pa / hPa).");
     return false;
   }
   if (!isfinite(lux) || lux < 0.0f) lux = 0.0f;
@@ -446,6 +450,20 @@ static void apiCalibrationPost(){
     resp["forecast_valid"] = g_forecastValid;
     resp["entries"] = info.entries;
     resp["coverage_h"] = coverage;
+    sendJSONDoc(resp);
+    return;
+  }
+  if (!strcmp(cmd,"create_file")){
+    bool force = d["force"] | false;
+    bool exists = LittleFS.exists(CALIBRATION_PATH);
+    if (exists && !force) return sendErr(409, F("Soubor již existuje."));
+    if (!calibrationCreateHistoryFile()) return sendErr(500, F("Soubor se nepodařilo vytvořit."));
+    CalibrationFileInfo info;
+    calibrationCollectInfo(info);
+    StaticJsonDocument<160> resp;
+    resp["ok"] = true;
+    resp["exists"] = info.exists;
+    resp["entries"] = info.entries;
     sendJSONDoc(resp);
     return;
   }

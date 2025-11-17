@@ -418,6 +418,7 @@
         <div class="btn-row">
           <button id="calibRefreshBtn" class="btn ghost">Přegenerovat predikci</button>
           <button id="calibClearBtn" class="btn ghost">Vymazat historii</button>
+          <button id="calibCreateBtn" class="btn ghost">Vytvořit soubor</button>
         </div>
         <div class="callout" id="calibHint">—</div>
       </div>
@@ -535,6 +536,7 @@ const fmt={
 };
 
 let AIRPORTS=null;
+let CALIB_INFO=null;
 
 function setSensorBadge(el,label,ok){el.textContent=label;el.className='pill '+(ok?'ok':'err');}
 
@@ -852,6 +854,7 @@ async function loadCalibrationInfo(){
   const statusEl=$('#calibStatus'); if(!statusEl) return;
   try{
     const info=await api('/api/calibration');
+    CALIB_INFO=info;
     statusEl.textContent=info.exists?'Soubor existuje':'Soubor zatím neexistuje';
     const entries=Number(info.entries)||0;
     $('#calibEntries').textContent=entries.toString();
@@ -872,6 +875,7 @@ async function loadCalibrationInfo(){
     $('#calibCoverage').textContent=coverage?`${coverage} h`:'—';
     $('#calibHint').textContent=info.status||'—';
   }catch(e){
+    CALIB_INFO=null;
     statusEl.textContent='Chyba čtení';
     const hint=$('#calibHint'); if(hint) hint.textContent='Chyba: '+(e.message||'HTTP');
   }
@@ -987,6 +991,22 @@ async function calibrationCommand(cmd){
   }
 }
 
+async function createCalibrationFile(){
+  const exists=CALIB_INFO&&CALIB_INFO.exists;
+  if(exists&&!confirm('Soubor již existuje. Vytvořením nového přijdete o historii. Pokračovat?')) return;
+  const hint=$('#calibHint'); if(hint) hint.textContent='Vytvářím soubor…';
+  try{
+    const body={cmd:'create_file'};
+    if(exists) body.force=true;
+    await api('/api/calibration',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    if(hint) hint.textContent='Soubor byl vytvořen.';
+    await loadCalibrationInfo();
+    await loadCalibrationHistory();
+  }catch(e){
+    if(hint) hint.textContent='Chyba: '+(e.message||'HTTP');
+  }
+}
+
 async function mbRead(){
   const addr=+$('#mb_addr').value, n=+$('#mb_n').value;
   const r=await api(`/api/mb?addr=${addr}&n=${n}`);
@@ -1022,6 +1042,7 @@ async function boot(){
   $('#applyBtn').onclick=()=>saveConfig(false);
   $('#calibRefreshBtn').onclick=()=>calibrationCommand('refresh');
   $('#calibClearBtn').onclick=()=>calibrationCommand('clear');
+  $('#calibCreateBtn').onclick=createCalibrationFile;
   $('#calibSaveBtn').onclick=saveCalibrationEntry;
   $('#calibResetBtn').onclick=resetCalibForm;
   $('#mbReadBtn').onclick=mbRead;
